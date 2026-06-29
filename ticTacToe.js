@@ -1,93 +1,121 @@
-// Tres en Raya (Tic Tac Toe) - 2 jugadores
+import { SFX } from '../sfx.js';
+import { celebrate, inviteTurn, pop, pulse } from '../gameFx.js';
+
+let prevBoard = null;
+let prevStatus = null;
+let liveRoot = null;
+
 const WIN_LINES = [
   [0, 1, 2], [3, 4, 5], [6, 7, 8],
   [0, 3, 6], [1, 4, 7], [2, 5, 8],
   [0, 4, 8], [2, 4, 6],
 ];
 
-export default {
-  meta: {
-    id: 'tictactoe',
-    name: 'Tres en Raya',
-    emoji: '⭕',
-    tagline: 'El clásico de toda la vida',
-    description: 'Consigue tres símbolos en línea (horizontal, vertical o diagonal) antes que tu rival.',
-    minPlayers: 2,
-    maxPlayers: 2,
-    gradient: 'linear-gradient(135deg, #6366f1, #8b5cf6)',
-  },
+function winLineStyle(indices) {
+  const positions = [
+    [0, 0], [1, 0], [2, 0],
+    [0, 1], [1, 1], [2, 1],
+    [0, 2], [1, 2], [2, 2],
+  ];
+  const [a, b] = [indices[0], indices[2]];
+  const [x1, y1] = positions[a];
+  const [x2, y2] = positions[b];
+  const cx = ((x1 + x2) / 2) * 33.33 + 16.665;
+  const cy = ((y1 + y2) / 2) * 33.33 + 16.665;
+  const len = Math.hypot(x2 - x1, y2 - y1) * 33.33;
+  const angle = Math.atan2(y2 - y1, x2 - x1) * (180 / Math.PI);
+  return { left: `${cx}%`, top: `${cy}%`, width: `${len}%`, transform: `translate(-50%, -50%) rotate(${angle}deg)` };
+}
 
-  init(players) {
-    return {
-      board: Array(9).fill(null),
-      marks: { [players[0].id]: 'X', [players[1].id]: 'O' },
-      turn: players[0].id,
-      status: 'playing',
-      winner: null,
-      winningLine: null,
-    };
-  },
+export default function render(ctx) {
+  const { view, root } = ctx;
+  if (!liveRoot || !root.contains(liveRoot)) {
+    root.innerHTML = '';
+    liveRoot = document.createElement('div');
+    liveRoot.className = 'ttt-wrap';
+    liveRoot.innerHTML = `
+      <div class="ttt-head"></div>
+      <div class="ttt-board-wrap">
+        <div class="ttt-board"></div>
+        <div class="ttt-winline" hidden></div>
+      </div>
+      <p class="ttt-status"></p>`;
+    root.appendChild(liveRoot);
+    const boardEl = liveRoot.querySelector('.ttt-board');
+    for (let i = 0; i < 9; i++) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ttt-cell';
+      btn.dataset.i = i;
+      btn.addEventListener('click', () => {
+        if (btn.disabled) return;
+        ctx.send({ type: 'place', index: i });
+      });
+      boardEl.appendChild(btn);
+    }
+  }
 
-  action(state, playerId, action) {
-    if (state.status !== 'playing') return { error: 'La partida ha terminado.' };
-    if (action.type !== 'place') return { error: 'Acción no válida.' };
-    if (state.turn !== playerId) return { error: 'No es tu turno.' };
+  const myMark = view.marks?.[ctx.me] || '?';
+  const oppId = Object.keys(view.marks || {}).find((id) => id !== ctx.me);
+  const oppMark = oppId ? view.marks[oppId] : '?';
+  const head = liveRoot.querySelector('.ttt-head');
+  head.innerHTML = `
+    <span class="ttt-you">Tú juegas <strong class="ttt-mark ${myMark === 'X' ? 'x' : 'o'}">${myMark}</strong></span>
+    <span class="ttt-opp">Rival: <strong class="ttt-mark ${oppMark === 'X' ? 'x' : 'o'}">${oppMark}</strong></span>`;
 
-    const i = action.index;
-    if (typeof i !== 'number' || i < 0 || i > 8) return { error: 'Casilla no válida.' };
-    if (state.board[i] !== null) return { error: 'Casilla ocupada.' };
+  const myTurn = view.turn === ctx.me && view.status === 'playing';
+  const winSet = new Set(view.winningLine || []);
+  const boardEl = liveRoot.querySelector('.ttt-board');
+  const boardWrap = liveRoot.querySelector('.ttt-board-wrap');
+  boardWrap.classList.toggle('my-turn', myTurn);
 
-    const mark = state.marks[playerId];
-    state.board[i] = mark;
-
-    for (const line of WIN_LINES) {
-      const [a, b, c] = line;
-      if (state.board[a] && state.board[a] === state.board[b] && state.board[a] === state.board[c]) {
-        state.status = 'finished';
-        state.winner = playerId;
-        state.winningLine = line;
-        return { state };
+  view.board.forEach((cell, i) => {
+    const btn = boardEl.children[i];
+    btn.className = 'ttt-cell';
+    btn.textContent = cell || '';
+    btn.disabled = !!cell || !myTurn;
+    if (cell) {
+      btn.classList.add('filled', cell === 'X' ? 'x' : 'o');
+      if (prevBoard && prevBoard[i] !== cell) {
+        pop(btn);
+        SFX.place();
       }
     }
+    if (winSet.has(i)) btn.classList.add('win');
+  });
 
-    if (state.board.every((cell) => cell !== null)) {
-      state.status = 'finished';
-      state.winner = null; // empate
-      return { state };
-    }
+  const winLineEl = liveRoot.querySelector('.ttt-winline');
+  if (view.winningLine?.length === 3) {
+    const style = winLineStyle(view.winningLine);
+    winLineEl.hidden = false;
+    Object.assign(winLineEl.style, style);
+    winLineEl.classList.add('show');
+  } else {
+    winLineEl.hidden = true;
+    winLineEl.classList.remove('show');
+  }
 
-    const ids = Object.keys(state.marks);
-    state.turn = ids.find((id) => id !== playerId);
-    return { state };
-  },
-
-  view(state) {
-    return state;
-  },
-
-  bots(state, botIds) {
-    if (state.status !== 'playing' || !botIds.has(state.turn)) return [];
-    const me = state.turn;
-    const opp = Object.keys(state.marks).find((id) => id !== me);
-    const myMark = state.marks[me];
-    const oppMark = state.marks[opp];
-    const b = state.board;
-    const tryWin = (mark) => {
-      for (const [a, c, d] of WIN_LINES) {
-        const line = [a, c, d];
-        const marks = line.map((i) => b[i]);
-        const empties = line.filter((i) => b[i] === null);
-        if (empties.length === 1 && marks.filter((m) => m === mark).length === 2) return empties[0];
+  const status = liveRoot.querySelector('.ttt-status');
+  if (view.status === 'finished') {
+    if (view.winner === ctx.me) {
+      status.textContent = '🎉 ¡Has ganado!';
+      if (prevStatus !== 'finished') {
+        SFX.gameWin(ctx.meta.id);
+        celebrate(liveRoot, '🎉', 36);
+        pulse(boardWrap, 'fx-pulse-win');
       }
-      return -1;
-    };
-    let idx = tryWin(myMark);
-    if (idx < 0) idx = tryWin(oppMark);
-    if (idx < 0 && b[4] === null) idx = 4;
-    if (idx < 0) {
-      const prefs = [0, 2, 6, 8, 1, 3, 5, 7].filter((i) => b[i] === null);
-      idx = prefs.length ? prefs[Math.floor(Math.random() * prefs.length)] : b.findIndex((c) => c === null);
+    } else if (view.winner) {
+      status.textContent = '😬 Has perdido…';
+      if (prevStatus !== 'finished') SFX.gameLose(ctx.meta.id);
+    } else {
+      status.textContent = '🤝 ¡Empate!';
+      if (prevStatus !== 'finished') SFX.draw();
     }
-    return [{ playerId: me, action: { type: 'place', index: idx } }];
-  },
-};
+    prevBoard = null;
+  } else {
+    status.textContent = myTurn ? '🎯 Te toca — elige casilla' : `Turno de ${ctx.nameOf(view.turn)}`;
+    if (myTurn) inviteTurn(status);
+    prevBoard = [...view.board];
+  }
+  prevStatus = view.status;
+}

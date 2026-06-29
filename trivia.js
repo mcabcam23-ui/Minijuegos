@@ -1,272 +1,388 @@
-// Trivia - dado temático, cultura general y cuenta atrás sincronizada
-import { pickQuestionByCategories } from './data/questions.js';
+import { SFX } from '../sfx.js';
+import { celebrate, inviteTurn, pop, pulse, sparks } from '../gameFx.js';
 
-const QUESTION_COUNT = 8;
-const QUESTION_MS = 20000;
-const DICE_MS = 3200;
-const THEME_MS = 2400;
-const REVEAL_MS = 5000;
+let timerInterval = null;
+let diceAnimToken = '';
+let lastRenderKey = '';
+let prevRevealKey = '';
+let lastTickSec = null;
+let diceLandedPlayed = false;
 
-/** Seis caras: 5 temáticas + cultura general (cualquier categoría). */
-export const DICE_FACES = [
-  { label: 'Geografía', icon: '🌍', categories: ['Geografía'] },
-  { label: 'Historia', icon: '📜', categories: ['Historia'] },
-  { label: 'Ciencia', icon: '🔬', categories: ['Ciencia', 'Astronomía', 'Naturaleza', 'Matemáticas'] },
-  { label: 'Deporte', icon: '⚽', categories: ['Deporte'] },
-  { label: 'Arte & Cine', icon: '🎨', categories: ['Arte', 'Cine', 'Música'] },
-  { label: 'Cultura general', icon: '🎲', categories: null },
-];
-
-function rollDice() {
-  return Math.floor(Math.random() * DICE_FACES.length);
-}
-
-function topScorer(scores, order) {
-  let best = -1;
-  let winner = null;
-  let tie = false;
-  for (const id of order) {
-    if (scores[id] > best) {
-      best = scores[id];
-      winner = id;
-      tie = false;
-    } else if (scores[id] === best) tie = true;
+function clearTimer() {
+  if (timerInterval) {
+    clearInterval(timerInterval);
+    timerInterval = null;
   }
-  return tie ? null : winner;
 }
 
-function startDiceRound(state) {
-  state.diceIndex = rollDice();
-  state.diceFace = DICE_FACES[state.diceIndex];
-  state.phase = 'dice';
-  state.diceStartedAt = Date.now();
-  state.diceEndsAt = Date.now() + DICE_MS;
-  state.answers = {};
-  state.answerOrder = [];
-  state.lastReveal = null;
-  state.currentQuestion = null;
-  state.questionDeadline = null;
-  state.themeStartedAt = null;
-  state.themeEndsAt = null;
+/** Clave estable: ignora answeredCount y otros campos que cambian sin cambiar la pantalla. */
+function renderKey(view) {
+  return [
+    view.phase,
+    view.index,
+    view.roundId ?? 0,
+    view.diceStartedAt ?? 0,
+    view.themeStartedAt ?? 0,
+    view.myAnswer ?? 'none',
+    view.status,
+    view.correct ?? '',
+  ].join('|');
 }
 
-function reveal(state) {
-  const q = state.currentQuestion;
-  if (!q) return { state };
+let prevGameStatus = '';
 
-  const correctInOrder = state.answerOrder.filter((id) => state.answers[id] === q.a);
-  const gained = {};
-  correctInOrder.forEach((id, rank) => {
-    const bonus = Math.max(0, 50 - rank * 10);
-    const pts = 100 + bonus;
-    state.scores[id] += pts;
-    gained[id] = pts;
+function checkGameOver(ctx) {
+  const { view, me, root } = ctx;
+  if (view.status !== 'finished' || prevGameStatus === 'finished') {
+    prevGameStatus = view.status;
+    return;
+  }
+  if (view.winner === me) {
+    SFX.gameWin('trivia');
+    celebrate(root.querySelector('.triv-wrap') || root, '🏆', 40);
+  } else if (view.winner) {
+    SFX.gameLose('trivia');
+  } else {
+    SFX.draw();
+  }
+  prevGameStatus = view.status;
+}
+
+export default function render(ctx) {
+  const { view, send, me, root } = ctx;
+  const key = renderKey(view);
+
+  if (key === lastRenderKey && root.querySelector('.triv-wrap')) {
+    patchLive(ctx);
+    return;
+  }
+
+  lastRenderKey = key;
+  clearTimer();
+  lastTickSec = null;
+  if (view.phase !== 'reveal') prevRevealKey = '';
+  if (view.phase === 'dice') diceLandedPlayed = false;
+  root.innerHTML = '';
+
+  const wrap = document.createElement('div');
+  wrap.className = 'triv-wrap';
+
+  const head = document.createElement('div');
+  head.className = 'triv-head';
+  const catLabel = phaseLabel(view);
+  head.innerHTML = `<span class="triv-cat">${escapeHtml(catLabel)}</span>
+    <span class="triv-progress">Pregunta ${view.index + 1} / ${view.total}</span>`;
+  wrap.appendChild(head);
+
+  const stage = document.createElement('div');
+  stage.className = 'triv-stage';
+  wrap.appendChild(stage);
+
+  if (view.phase === 'dice') {
+    stage.appendChild(buildDicePanel(view));
+    wrap.appendChild(buildScores(ctx, view));
+    root.appendChild(wrap);
+    runDiceAnimation(view, root);
+    checkGameOver(ctx);
+    return;
+  }
+
+  if (view.phase === 'theme') {
+    stage.appendChild(buildThemePanel(view));
+    wrap.appendChild(buildScores(ctx, view));
+    root.appendChild(wrap);
+    requestAnimationFrame(() => {
+      stage.querySelector('.triv-theme-card')?.classList.add('show');
+      stage.querySelector('.triv-theme-prepare')?.classList.add('show');
+    });
+    checkGameOver(ctx);
+    return;
+  }
+
+  const panel = buildQuestionPanel(ctx, view, me, send);
+  stage.appendChild(panel);
+  wrap.appendChild(buildScores(ctx, view));
+  root.appendChild(wrap);
+
+  requestAnimationFrame(() => {
+    panel.classList.add('show');
+    panel.querySelectorAll('.triv-opt').forEach((el, i) => {
+      el.style.animationDelay = `${120 + i * 70}ms`;
+      el.classList.add('in');
+    });
   });
 
-  state.phase = 'reveal';
-  state.lastReveal = { correct: q.a, answers: { ...state.answers }, gained };
-  return { state, delayedAction: { type: '_next', delayMs: REVEAL_MS } };
+  startQuestionTimer(view, panel);
+  checkGameOver(ctx);
 }
 
-export default {
-  meta: {
-    id: 'trivia',
-    name: 'Trivia',
-    emoji: '❓',
-    tagline: 'Dado temático y cuenta atrás',
-    description: 'Tira el dado para elegir la temática. Si sale cultura general, ¡pregunta de cualquier tema! Responde antes de que acabe la cuenta atrás.',
-    minPlayers: 2,
-    maxPlayers: 8,
-    gradient: 'linear-gradient(135deg, #8b5cf6, #d946ef)',
-  },
+function patchLive(ctx) {
+  const { view, me, root } = ctx;
+  const oldScores = root.querySelector('.triv-scores');
+  if (oldScores) oldScores.replaceWith(buildScores(ctx, view));
 
-  init(players) {
-    const scores = {};
-    for (const p of players) scores[p.id] = 0;
-    const state = {
-      index: 0,
-      total: QUESTION_COUNT,
-      phase: 'dice',
-      diceIndex: 0,
-      diceFace: null,
-      diceStartedAt: null,
-      diceEndsAt: null,
-      currentQuestion: null,
-      usedQuestionKeys: [],
-      answers: {},
-      answerOrder: [],
-      lastReveal: null,
-      order: players.map((p) => p.id),
-      scores,
-      timeLimit: Math.floor(QUESTION_MS / 1000),
-      questionDeadline: null,
-      roundId: 0,
-      status: 'playing',
-      winner: null,
-    };
-    startDiceRound(state);
-    return {
-      state,
-      delayedAction: { type: '_showTheme', delayMs: DICE_MS },
-    };
-  },
+  const status = root.querySelector('.triv-status');
+  if (!status) return;
 
-  action(state, playerId, action) {
-    if (action.type === '_showTheme') {
-      if (state.status !== 'playing' || state.phase !== 'dice') return { state };
-      state.phase = 'theme';
-      state.themeStartedAt = Date.now();
-      state.themeEndsAt = Date.now() + THEME_MS;
-      return {
-        state,
-        delayedAction: { type: '_startQuestion', delayMs: THEME_MS },
-      };
+  const answered = view.myAnswer !== undefined && view.myAnswer !== null;
+  const reveal = view.phase === 'reveal' || view.status === 'finished';
+
+  if (reveal) {
+    const rk = `${view.index}:${view.correct}:${view.myAnswer}`;
+    if (rk !== prevRevealKey) {
+      if (view.myAnswer === view.correct) {
+        SFX.trivCorrect();
+        sparks(root.querySelector('.triv-wrap') || root, '✨', 5);
+        pop(status);
+      } else if (answered) SFX.trivWrong();
+      prevRevealKey = rk;
     }
+    const gained = view.reveal?.gained?.[me] || 0;
+    status.textContent = view.myAnswer === view.correct
+      ? `✅ ¡Correcto! +${gained} puntos`
+      : (answered ? '❌ Respuesta incorrecta' : '⏱️ Sin respuesta');
+    status.classList.toggle('good', view.myAnswer === view.correct);
+    status.classList.toggle('bad', view.myAnswer !== view.correct);
+  } else if (answered) {
+    status.textContent = `Respuesta enviada · esperando (${view.answeredCount}/${view.playerCount})`;
+  }
+  checkGameOver(ctx);
+}
 
-    if (action.type === '_startQuestion') {
-      if (state.status !== 'playing' || state.phase !== 'theme') return { state };
-      const face = state.diceFace || DICE_FACES[state.diceIndex];
-      const q = pickQuestionByCategories(face.categories, state.usedQuestionKeys);
-      state.usedQuestionKeys.push(`${q.c}|${q.q}`);
-      state.currentQuestion = q;
-      state.phase = 'question';
-      state.answers = {};
-      state.answerOrder = [];
-      state.roundId = (state.roundId || 0) + 1;
-      state.questionDeadline = Date.now() + QUESTION_MS;
-      return {
-        state,
-        delayedAction: { type: '_timeout', delayMs: QUESTION_MS, roundId: state.roundId },
-      };
-    }
+function startQuestionTimer(view, panel) {
+  const reveal = view.phase === 'reveal' || view.status === 'finished';
+  const answered = view.myAnswer !== undefined && view.myAnswer !== null;
+  if (reveal || answered || !view.questionDeadline) return;
 
-    if (action.type === '_timeout') {
-      if (state.status !== 'playing' || state.phase !== 'question') return { state };
-      if (action.roundId !== undefined && action.roundId !== state.roundId) return { state };
-      for (const id of state.order) {
-        if (state.answers[id] === undefined) {
-          state.answers[id] = -1;
-          state.answerOrder.push(id);
-        }
+  const fill = panel.querySelector('.triv-timefill');
+  const countdown = panel.querySelector('.triv-countdown');
+  timerInterval = setInterval(() => updateTimer(view, fill, countdown), 100);
+  updateTimer(view, fill, countdown);
+}
+
+function phaseLabel(view) {
+  if (view.phase === 'dice') return 'Tirando el dado…';
+  if (view.phase === 'theme') return view.diceFace?.label || 'Temática';
+  if (view.question?.c) return view.question.c;
+  return view.diceFace?.label || 'Trivia';
+}
+
+function buildDicePanel(view) {
+  const box = document.createElement('div');
+  box.className = 'triv-panel triv-panel-dice';
+  box.innerHTML = `
+    <p class="triv-dice-title">🎲 Tirando el dado temático…</p>
+    <div class="triv-dice" id="triv-dice">
+      <div class="triv-dice-face" id="triv-dice-face">🎲</div>
+    </div>
+    <p class="triv-dice-hint" id="triv-dice-hint">La temática aparecerá al detenerse</p>
+    <div class="triv-dice-faces" id="triv-dice-legend"></div>
+  `;
+  const legend = box.querySelector('#triv-dice-legend');
+  (view.diceFaces || []).forEach((face) => {
+    const chip = document.createElement('span');
+    chip.className = 'triv-dice-chip';
+    chip.textContent = `${face.icon} ${face.label}`;
+    legend.appendChild(chip);
+  });
+  return box;
+}
+
+function buildThemePanel(view) {
+  const face = view.diceFace || view.diceFaces?.[view.diceIndex];
+  const box = document.createElement('div');
+  box.className = 'triv-panel triv-panel-theme';
+  box.innerHTML = `
+    <p class="triv-theme-kicker">¡Temática elegida!</p>
+    <div class="triv-theme-card">
+      <span class="triv-theme-icon">${face?.icon || '🎲'}</span>
+      <h3 class="triv-theme-name">${escapeHtml(face?.label || 'Cultura general')}</h3>
+    </div>
+    <p class="triv-theme-prepare">Preparando la pregunta…</p>
+  `;
+  return box;
+}
+
+function buildQuestionPanel(ctx, view, me, send) {
+  const panel = document.createElement('div');
+  panel.className = 'triv-panel triv-panel-question';
+
+  const timeBar = document.createElement('div');
+  timeBar.className = 'triv-timebar';
+  const fill = document.createElement('div');
+  fill.className = 'triv-timefill';
+  timeBar.appendChild(fill);
+  panel.appendChild(timeBar);
+
+  const countdown = document.createElement('div');
+  countdown.className = 'triv-countdown';
+  countdown.textContent = String(view.timeLimit || 20);
+  panel.appendChild(countdown);
+
+  const reveal = view.phase === 'reveal' || view.status === 'finished';
+  const answered = view.myAnswer !== undefined && view.myAnswer !== null;
+
+  if (view.question) {
+    const qEl = document.createElement('div');
+    qEl.className = 'triv-question';
+    qEl.textContent = view.question.q;
+    panel.appendChild(qEl);
+
+    const opts = document.createElement('div');
+    opts.className = 'triv-options' + (reveal ? ' triv-options-reveal' : '');
+    view.question.o.forEach((text, i) => {
+      const b = document.createElement('button');
+      b.className = 'triv-opt';
+      b.innerHTML = `<span class="triv-letter">${'ABCD'[i]}</span> ${escapeHtml(text)}`;
+      if (reveal) {
+        if (i === view.correct) b.classList.add('correct');
+        else if (view.myAnswer === i) b.classList.add('wrong');
+      } else if (view.myAnswer === i) {
+        b.classList.add('chosen');
       }
-      return reveal(state);
-    }
+      b.disabled = reveal || answered;
+      b.addEventListener('click', () => send({ type: 'answer', option: i }));
+      opts.appendChild(b);
+    });
+    panel.appendChild(opts);
+  }
 
-    if (action.type === '_next') {
-      if (state.phase !== 'reveal') return { state };
-      if (state.index + 1 >= state.total) {
-        state.status = 'finished';
-        state.winner = topScorer(state.scores, state.order);
-        state.phase = 'reveal';
-        return { state };
+  const status = document.createElement('p');
+  status.className = 'triv-status';
+  if (reveal) {
+    const rk = `${view.index}:${view.correct}:${view.myAnswer}`;
+    if (rk !== prevRevealKey) {
+      if (view.myAnswer === view.correct) {
+        SFX.trivCorrect();
+        sparks(root.querySelector('.triv-wrap') || root, '✨', 5);
+        pop(status);
+      } else if (answered) SFX.trivWrong();
+      prevRevealKey = rk;
+    }
+    const gained = view.reveal?.gained?.[me] || 0;
+    status.textContent = view.myAnswer === view.correct
+      ? `✅ ¡Correcto! +${gained} puntos`
+      : (answered ? '❌ Respuesta incorrecta' : '⏱️ Sin respuesta');
+    status.classList.add(view.myAnswer === view.correct ? 'good' : 'bad');
+  } else if (answered) {
+    status.textContent = `Respuesta enviada · esperando (${view.answeredCount}/${view.playerCount})`;
+  } else {
+    status.textContent = '¡Elige tu respuesta!';
+    inviteTurn(status);
+  }
+  panel.appendChild(status);
+
+  if (!reveal && ctx.hostId === me) {
+    const skip = document.createElement('button');
+    skip.className = 'btn btn-ghost triv-skip';
+    skip.textContent = '⏭️ Saltar pregunta';
+    skip.addEventListener('click', () => send({ type: 'skip' }));
+    panel.appendChild(skip);
+  }
+
+  if (reveal || answered) {
+    panel.classList.add('show');
+    panel.querySelectorAll('.triv-opt').forEach((el) => el.classList.add('in'));
+  }
+
+  return panel;
+}
+
+function runDiceAnimation(view, root) {
+  const token = `${view.index}-${view.diceStartedAt}`;
+  diceAnimToken = token;
+
+  const faceEl = root.querySelector('#triv-dice-face');
+  const diceEl = root.querySelector('#triv-dice');
+  const hintEl = root.querySelector('#triv-dice-hint');
+  const chips = [...root.querySelectorAll('.triv-dice-chip')];
+  if (!faceEl || !view.diceFaces?.length) return;
+
+  const endAt = view.diceEndsAt || Date.now() + 3200;
+  let tick = 0;
+  let spinTimer = null;
+
+  const stopSpin = () => {
+    if (spinTimer) clearTimeout(spinTimer);
+    spinTimer = null;
+  };
+
+  const spin = () => {
+    if (diceAnimToken !== token || Date.now() >= endAt) return;
+    tick += 1;
+    const idx = tick % view.diceFaces.length;
+    const f = view.diceFaces[idx];
+    faceEl.textContent = f.icon;
+    chips.forEach((c, i) => c.classList.toggle('active', i === idx));
+    diceEl?.classList.add('rolling');
+    const remaining = endAt - Date.now();
+    const delay = remaining < 900 ? 160 + (900 - remaining) / 8 : 72;
+    spinTimer = setTimeout(spin, delay);
+  };
+
+  spin();
+
+  setTimeout(() => {
+    if (diceAnimToken !== token) return;
+    stopSpin();
+    diceEl?.classList.remove('rolling');
+    diceEl?.classList.add('landed');
+    const final = view.diceFaces[view.diceIndex] || view.diceFace;
+    if (final) {
+      faceEl.textContent = final.icon;
+      chips.forEach((c, i) => c.classList.toggle('active', i === view.diceIndex));
+      if (hintEl) {
+        hintEl.textContent = final.label;
+        hintEl.classList.add('revealed');
       }
-      state.index += 1;
-      startDiceRound(state);
-      return {
-        state,
-        delayedAction: { type: '_showTheme', delayMs: DICE_MS },
-      };
-    }
-
-    if (state.status !== 'playing') return { error: 'La partida ha terminado.' };
-
-    if (action.type === 'skip') {
-      if (state.phase !== 'question') return { error: 'Nada que saltar.' };
-      for (const id of state.order) {
-        if (state.answers[id] === undefined) {
-          state.answers[id] = -1;
-          state.answerOrder.push(id);
-        }
-      }
-      return reveal(state);
-    }
-
-    if (action.type !== 'answer') return { error: 'Acción no válida.' };
-    if (state.phase !== 'question') return { error: 'Espera a la siguiente pregunta.' };
-    if (playerId && state.answers[playerId] !== undefined) return { error: 'Ya has respondido.' };
-
-    const opt = action.option;
-    state.answers[playerId] = typeof opt === 'number' && opt >= 0 && opt <= 3 ? opt : -1;
-    state.answerOrder.push(playerId);
-
-    if (state.order.every((id) => state.answers[id] !== undefined)) {
-      return reveal(state);
-    }
-    return { state };
-  },
-
-  view(state, playerId) {
-    const q = state.currentQuestion;
-    const face = state.diceFace || (state.diceIndex != null ? DICE_FACES[state.diceIndex] : null);
-    const base = {
-      phase: state.phase,
-      index: state.index,
-      total: state.total,
-      scores: state.scores,
-      order: state.order,
-      timeLimit: state.timeLimit,
-      questionDeadline: state.questionDeadline,
-      roundId: state.roundId,
-      diceFaces: DICE_FACES.map((f) => ({ label: f.label, icon: f.icon })),
-      diceIndex: state.diceIndex,
-      diceFace: face ? { label: face.label, icon: face.icon } : null,
-      diceStartedAt: state.diceStartedAt,
-      diceEndsAt: state.diceEndsAt,
-      themeStartedAt: state.themeStartedAt,
-      themeEndsAt: state.themeEndsAt,
-      diceMs: DICE_MS,
-      themeMs: THEME_MS,
-      status: state.status,
-      winner: state.winner,
-      answeredCount: Object.keys(state.answers).length,
-      playerCount: state.order.length,
-      myAnswer: state.answers[playerId],
-    };
-
-    if (state.phase === 'question' || state.phase === 'reveal' || state.status === 'finished') {
-      if (q) {
-        base.question = {
-          c: state.diceFace?.label === 'Cultura general' ? `Cultura general · ${q.c}` : (state.diceFace?.label || q.c),
-          q: q.q,
-          o: q.o,
-        };
-      }
-    }
-
-    if (state.phase === 'reveal' || state.status === 'finished') {
-      if (q) base.correct = q.a;
-      base.reveal = state.lastReveal;
-    }
-
-    return base;
-  },
-
-  bots(state, botIds) {
-    if (state.status !== 'playing' || state.phase !== 'question') return [];
-    const q = state.currentQuestion;
-    if (!q) return [];
-    for (const id of state.order) {
-      if (botIds.has(id) && state.answers[id] === undefined) {
-        let option;
-        if (Math.random() < 0.55) option = q.a;
-        else {
-          const wrong = [0, 1, 2, 3].filter((o) => o !== q.a);
-          option = wrong[Math.floor(Math.random() * wrong.length)];
-        }
-        return [{ playerId: id, action: { type: 'answer', option } }];
+      if (!diceLandedPlayed) {
+        SFX.trivDice();
+        diceLandedPlayed = true;
+        pulse(diceEl, 'fx-pulse-win');
       }
     }
-    return [];
-  },
+  }, Math.max(0, endAt - Date.now()));
+}
 
-  syncAfterLeave(state, leftPlayerId) {
-    if (state.phase !== 'question') return { state };
-    if (state.answers[leftPlayerId] !== undefined) return { state };
-    state.answers[leftPlayerId] = -1;
-    state.answerOrder.push(leftPlayerId);
-    if (state.order.every((id) => state.answers[id] !== undefined)) {
-      return reveal(state);
-    }
-    return { state };
-  },
-};
+function updateTimer(view, fillEl, countdownEl) {
+  if (!fillEl || !countdownEl) return;
+  const deadline = view.questionDeadline || Date.now();
+  const totalMs = (view.timeLimit || 20) * 1000;
+  const remaining = Math.max(0, deadline - Date.now());
+  const secs = Math.ceil(remaining / 1000);
+  const pct = Math.max(0, (remaining / totalMs) * 100);
+
+  fillEl.style.width = `${pct}%`;
+  fillEl.style.background = pct < 30 ? '#ff5c7c' : 'linear-gradient(90deg,#46e0c8,#7c5cff)';
+  countdownEl.textContent = String(secs);
+  countdownEl.classList.toggle('urgent', secs <= 5);
+
+  if (secs <= 5 && secs !== lastTickSec) {
+    SFX.trivTick();
+    lastTickSec = secs;
+  }
+
+  if (remaining <= 0) {
+    clearTimer();
+    countdownEl.textContent = '0';
+    countdownEl.classList.add('urgent');
+    fillEl.style.width = '0%';
+  }
+}
+
+function buildScores(ctx, view) {
+  const sorted = [...view.order].sort((a, b) => view.scores[b] - view.scores[a]);
+  const row = document.createElement('div');
+  row.className = 'triv-scores';
+  sorted.forEach((id) => {
+    const { color, initials } = ctx.avatarFor(id, ctx.nameOf(id));
+    const s = document.createElement('div');
+    s.className = 'triv-score';
+    const g = view.reveal?.gained?.[id];
+    s.innerHTML = `<span class="avatar" style="width:24px;height:24px;font-size:.75rem;background:${color}">${initials}</span>
+      ${escapeHtml(ctx.nameOf(id))}${id === ctx.me ? ' (Tú)' : ''} · <strong>${view.scores[id]}</strong>
+      ${g ? `<span class="triv-gain">+${g}</span>` : ''}`;
+    row.appendChild(s);
+  });
+  return row;
+}

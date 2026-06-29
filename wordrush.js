@@ -1,150 +1,148 @@
-// Word Rush — carrera Wordle multijugador (2–4)
-import { randomWord } from './data/words.js';
+import { SFX } from '../sfx.js';
+import { celebrate, inviteTurn, pop } from '../gameFx.js';
+import { buildScoreChip } from './shared.js';
 
-const MAX_GUESSES = 6;
-const WORD_LEN = 5;
+const ROWS = 6;
+const COLS = 5;
+let liveRoot = null;
+let prevStatus = null;
+let draft = '';
+let prevGuessCount = 0;
+let lastCtx = null;
 
-function normalize(w) {
-  return w.toUpperCase().replace(/[^A-Z]/g, '');
-}
+export default function render(ctx) {
+  lastCtx = ctx;
+  const { view, me, root } = ctx;
+  const myTurn = view.turn === me && view.status === 'playing';
+  const canGuess = myTurn && view.myGuesses.length < view.maxGuesses;
 
-function feedback(secret, guess) {
-  const s = normalize(secret).padEnd(WORD_LEN, 'X').slice(0, WORD_LEN);
-  const g = normalize(guess).padEnd(WORD_LEN, 'X').slice(0, WORD_LEN);
-  const result = Array(WORD_LEN).fill('absent');
-  const sCounts = {};
-  for (let i = 0; i < WORD_LEN; i++) {
-    if (g[i] === s[i]) {
-      result[i] = 'correct';
-    } else {
-      sCounts[s[i]] = (sCounts[s[i]] || 0) + 1;
-    }
+  if (!liveRoot || !root.contains(liveRoot)) {
+    root.innerHTML = '';
+    draft = '';
+    liveRoot = document.createElement('div');
+    liveRoot.className = 'wr-wrap';
+    liveRoot.innerHTML = `
+      <div class="wr-head"></div>
+      <div class="wr-grid"></div>
+      <div class="wr-keyboard"></div>
+      <div class="wr-actions">
+        <button type="button" class="btn btn-ghost wr-back">⌫</button>
+        <button type="button" class="btn btn-primary wr-send" disabled>Enviar</button>
+      </div>
+      <p class="wr-hint"></p>`;
+    root.appendChild(liveRoot);
+
+    const kb = liveRoot.querySelector('.wr-keyboard');
+    'QWERTYUIOPASDFGHJKLÑZXCVBNM'.split('').forEach((ch) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'wr-key';
+      b.textContent = ch;
+      b.addEventListener('click', () => onKey(ch));
+      kb.appendChild(b);
+    });
+
+    liveRoot.querySelector('.wr-back').addEventListener('click', () => {
+      draft = draft.slice(0, -1);
+      syncDraftUI();
+    });
+    liveRoot.querySelector('.wr-send').addEventListener('click', onSubmit);
   }
-  for (let i = 0; i < WORD_LEN; i++) {
-    if (result[i] === 'correct') continue;
-    const ch = g[i];
-    if (sCounts[ch] > 0) {
-      result[i] = 'present';
-      sCounts[ch]--;
-    }
-  }
-  return result;
-}
 
-function pickWord() {
-  for (let t = 0; t < 40; t++) {
-    const { word } = randomWord();
-    const w = normalize(word);
-    if (w.length === WORD_LEN) return w;
-  }
-  return 'MUNDO';
-}
+  const head = liveRoot.querySelector('.wr-head');
+  head.innerHTML = '';
+  Object.entries(view.others || {}).forEach(([id, count]) => {
+    head.appendChild(buildScoreChip(ctx, id, `${count}/${view.maxGuesses}`, view.turn === id));
+  });
+  head.appendChild(buildScoreChip(ctx, me, `${view.myGuesses.length}/${view.maxGuesses}`, myTurn));
 
-export default {
-  meta: {
-    id: 'wordrush',
-    name: 'Word Rush',
-    emoji: '📝',
-    tagline: 'Wordle en carrera',
-    description: 'Adivina la palabra de 5 letras antes que tus rivales. Verde = acierto, amarillo = letra en otra posición.',
-    minPlayers: 2,
-    maxPlayers: 4,
-    gradient: 'linear-gradient(135deg, #22c55e, #16a34a)',
-  },
-
-  init(players) {
-    const guesses = {};
-    for (const p of players) guesses[p.id] = [];
-    return {
-      secret: pickWord(),
-      guesses,
-      order: players.map((p) => p.id),
-      turn: players[0].id,
-      status: 'playing',
-      winner: null,
-      lastGuess: null,
-      maxGuesses: MAX_GUESSES,
-    };
-  },
-
-  action(state, playerId, action) {
-    if (state.status !== 'playing') return { error: 'La partida ha terminado.' };
-    if (action.type !== 'guess') return { error: 'Acción no válida.' };
-    if (state.turn !== playerId) return { error: 'No es tu turno.' };
-    if (state.guesses[playerId].length >= MAX_GUESSES) return { error: 'Sin intentos.' };
-
-    const word = normalize(action.word || '');
-    if (word.length !== WORD_LEN) return { error: 'La palabra debe tener 5 letras.' };
-
-    const fb = feedback(state.secret, word);
-    state.guesses[playerId].push({ word, feedback: fb });
-    state.lastGuess = { by: playerId, word, feedback: fb };
-
-    if (fb.every((x) => x === 'correct')) {
-      state.status = 'finished';
-      state.winner = playerId;
-      return { state };
-    }
-
-    const allDone = state.order.every((id) => state.guesses[id].length >= MAX_GUESSES);
-    if (allDone) {
-      state.status = 'finished';
-      let best = -1;
-      let winner = null;
-      let tie = false;
-      for (const id of state.order) {
-        const gs = state.guesses[id];
-        let score = 0;
-        for (const g of gs) score += g.feedback.filter((x) => x === 'correct').length;
-        if (score > best) {
-          best = score;
-          winner = id;
-          tie = false;
-        } else if (score === best) tie = true;
+  const grid = liveRoot.querySelector('.wr-grid');
+  grid.innerHTML = '';
+  for (let r = 0; r < ROWS; r++) {
+    const row = document.createElement('div');
+    row.className = 'wr-row';
+    const g = view.myGuesses[r];
+    for (let c = 0; c < COLS; c++) {
+      const tile = document.createElement('span');
+      tile.className = 'wr-tile';
+      if (g) {
+        tile.textContent = g.word[c] || '';
+        tile.classList.add(g.feedback[c]);
+      } else if (r === view.myGuesses.length && c < draft.length) {
+        tile.textContent = draft[c];
+        tile.classList.add('draft');
       }
-      state.winner = tie ? null : winner;
-      return { state };
+      row.appendChild(tile);
     }
+    grid.appendChild(row);
+  }
 
-    const idx = state.order.indexOf(playerId);
-    state.turn = state.order[(idx + 1) % state.order.length];
-    return { state };
-  },
+  syncDraftUI();
+  liveRoot.querySelectorAll('.wr-key').forEach((b) => { b.disabled = !canGuess; });
+  liveRoot.querySelector('.wr-back').disabled = !canGuess || !draft.length;
 
-  view(state, playerId) {
-    const mine = state.guesses[playerId] || [];
-    const others = {};
-    for (const id of state.order) {
-      if (id === playerId) continue;
-      others[id] = (state.guesses[id] || []).length;
+  const hint = liveRoot.querySelector('.wr-hint');
+  if (view.status === 'finished') {
+    hint.textContent = view.winner === me ? '🎉 ¡Palabra correcta!' : view.winner ? `Ganó ${ctx.nameOf(view.winner)}` : '🤝 Empate';
+    if (view.secret) hint.textContent += ` · Era ${view.secret}`;
+    if (prevStatus !== 'finished') {
+      if (view.winner === me) { SFX.gameWin(ctx.meta.id); celebrate(liveRoot, '🎉', 40); }
+      else if (view.winner) SFX.gameLose(ctx.meta.id);
+      else SFX.draw();
     }
-    return {
-      myGuesses: mine,
-      others,
-      turn: state.turn,
-      status: state.status,
-      winner: state.winner,
-      lastGuess: state.lastGuess,
-      maxGuesses: state.maxGuesses,
-      secret: state.status === 'finished' ? state.secret : null,
-    };
-  },
+  } else if (canGuess) {
+    hint.textContent = '⌨️ Escribe tu palabra de 5 letras';
+    inviteTurn(hint);
+  } else {
+    hint.textContent = `Turno de ${ctx.nameOf(view.turn)}`;
+  }
 
-  bots(state, botIds) {
-    if (state.status !== 'playing' || !botIds.has(state.turn)) return [];
-    const me = state.turn;
-    const secret = state.secret;
-    const known = state.guesses[me];
-    const letters = 'AEIOURSTLNCPMDG'.split('');
-    let word = '';
-    for (let i = 0; i < WORD_LEN; i++) {
-      if (known.length && known[known.length - 1].feedback[i] === 'correct') {
-        word += known[known.length - 1].word[i];
-      } else {
-        word += letters[Math.floor(Math.random() * letters.length)];
-      }
+  if (view.myGuesses.length > prevGuessCount) {
+    const last = view.myGuesses[view.myGuesses.length - 1];
+    if (last.feedback.every((x) => x === 'correct')) SFX.wrWin();
+    else SFX.wrGuess();
+    const row = grid.children[view.myGuesses.length - 1];
+    row?.querySelectorAll('.wr-tile').forEach((t) => pop(t));
+  }
+  prevGuessCount = view.myGuesses.length;
+  prevStatus = view.status;
+}
+
+function onKey(ch) {
+  const ctx = lastCtx;
+  if (!ctx) return;
+  const { view, me } = ctx;
+  if (view.status !== 'playing' || view.turn !== me) return;
+  if (view.myGuesses.length >= view.maxGuesses || draft.length >= COLS) return;
+  draft += ch;
+  SFX.wrType();
+  syncDraftUI();
+}
+
+function onSubmit() {
+  const ctx = lastCtx;
+  if (!ctx || draft.length !== COLS) return;
+  ctx.send({ type: 'guess', word: draft });
+  draft = '';
+  syncDraftUI();
+}
+
+function syncDraftUI() {
+  if (!liveRoot) return;
+  const ctx = lastCtx;
+  const canGuess = ctx && ctx.view.turn === ctx.me && ctx.view.status === 'playing' && ctx.view.myGuesses.length < ctx.view.maxGuesses;
+  liveRoot.querySelector('.wr-send').disabled = draft.length !== COLS || !canGuess;
+  const grid = liveRoot.querySelector('.wr-grid');
+  if (!grid || !ctx) return;
+  const row = grid.children[ctx.view.myGuesses.length];
+  if (!row) return;
+  [...row.children].forEach((tile, c) => {
+    if (c < draft.length) {
+      tile.textContent = draft[c];
+      tile.className = 'wr-tile draft';
+    } else if (!ctx.view.myGuesses[ctx.view.myGuesses.length]) {
+      tile.textContent = '';
+      tile.className = 'wr-tile';
     }
-    if (Math.random() < 0.08) word = secret;
-    return [{ playerId: me, action: { type: 'guess', word } }];
-  },
-};
+  });
+}

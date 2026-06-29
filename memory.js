@@ -1,147 +1,96 @@
-// Memoria (encuentra las parejas) - 2 a 4 jugadores por turnos
-const EMOJIS = ['🐶', '🐱', '🦊', '🐼', '🦁', '🐸', '🐵', '🐧', '🦄', '🐙', '🦋', '🌸', '🍕', '🍩', '⚽', '🚀', '🎸', '👑'];
-const PAIRS = 12;
+import { SFX } from '../sfx.js';
+import { celebrate, inviteTurn, pop, shake, sparks } from '../gameFx.js';
 
-function shuffle(arr) {
-  const a = [...arr];
-  for (let i = a.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [a[i], a[j]] = [a[j], a[i]];
-  }
-  return a;
+let prevMatched = new Set();
+let prevSnapshot = null;
+let prevStatus = null;
+
+function snapshot(view) {
+  return view.cards.map((c) => `${c.faceUp ? 1 : 0}${c.matched ? 1 : 0}`).join('');
 }
 
-export default {
-  meta: {
-    id: 'memory',
-    name: 'Memoria',
-    emoji: '🧠',
-    tagline: 'Encuentra todas las parejas',
-    description: 'Voltea cartas por turnos y memoriza su posición. Si haces pareja, sumas punto y repites. ¡Gana quien tenga más parejas!',
-    minPlayers: 2,
-    maxPlayers: 4,
-    gradient: 'linear-gradient(135deg, #14b8a6, #22c55e)',
-  },
+export default function render(ctx) {
+  const { view, send, me, root } = ctx;
+  const myTurn = view.turn === me && view.status === 'playing';
+  const order = view.order || Object.keys(view.scores);
+  const snap = snapshot(view);
 
-  init(players) {
-    const values = shuffle(EMOJIS.slice(0, PAIRS).flatMap((e) => [e, e]));
-    const cards = values.map((v, i) => ({ id: i, value: v, matched: false, faceUp: false, matchedBy: null }));
-    const scores = {};
-    for (const p of players) scores[p.id] = 0;
-    return {
-      cards,
-      scores,
-      order: players.map((p) => p.id),
-      turn: players[0].id,
-      flipped: [],
-      pendingClear: false,
-      seen: [],
-      status: 'playing',
-      winner: null,
-    };
-  },
+  if (prevSnapshot && snap !== prevSnapshot) {
+    const prevUp = (prevSnapshot.match(/1/g) || []).length;
+    const curUp = (snap.match(/1/g) || []).length;
+    const prevMatched = prevSnapshot.split('').filter((_, i) => i % 2 === 1 && prevSnapshot[i] === '1').length;
+    const curMatched = snap.split('').filter((_, i) => i % 2 === 1 && snap[i] === '1').length;
 
-  action(state, playerId, action) {
-    if (action.type === '_clear') {
-      for (const idx of state.flipped) {
-        if (state.cards[idx] && !state.cards[idx].matched) state.cards[idx].faceUp = false;
-      }
-      state.flipped = [];
-      state.pendingClear = false;
-      return { state };
-    }
+    if (curMatched > prevMatched) SFX.memMatch();
+    else if (view.pendingClear && curUp > prevUp) SFX.memMiss();
+    else if (curUp > prevUp && !view.pendingClear) SFX.memFlip();
+  }
+  prevSnapshot = snap;
 
-    if (state.status !== 'playing') return { error: 'La partida ha terminado.' };
-    if (action.type !== 'flip') return { error: 'Acción no válida.' };
-    if (state.turn !== playerId) return { error: 'No es tu turno.' };
-    if (state.pendingClear || state.flipped.length >= 2) return { error: 'Espera un momento...' };
+  const pairsLeft = view.cards.filter((c) => !c.matched).length / 2;
 
-    const idx = action.index;
-    const card = state.cards[idx];
-    if (!card) return { error: 'Carta no válida.' };
-    if (card.matched || card.faceUp) return { error: 'Carta ya revelada.' };
+  root.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'mem-wrap';
 
-    card.faceUp = true;
-    state.flipped.push(idx);
-    if (!state.seen.includes(idx)) state.seen.push(idx);
+  const scores = document.createElement('div');
+  scores.className = 'mem-scores';
+  order.forEach((id) => {
+    const { color, initials } = ctx.avatarFor(id, ctx.nameOf(id));
+    const s = document.createElement('div');
+    s.className = 'mem-score' + (view.turn === id ? ' turn' : '');
+    s.innerHTML = `<span class="avatar" style="width:26px;height:26px;font-size:.8rem;background:${color}">${initials}</span>
+      ${escapeHtml(ctx.nameOf(id))}${id === me ? ' (Tú)' : ''} · <strong>${view.scores[id]}</strong>`;
+    scores.appendChild(s);
+  });
+  wrap.appendChild(scores);
 
-    if (state.flipped.length === 2) {
-      const [a, b] = state.flipped;
-      if (state.cards[a].value === state.cards[b].value) {
-        state.cards[a].matched = true;
-        state.cards[b].matched = true;
-        state.cards[a].matchedBy = playerId;
-        state.cards[b].matchedBy = playerId;
-        state.scores[playerId] += 1;
-        state.flipped = [];
+  const bar = document.createElement('div');
+  bar.className = 'mem-bar';
+  if (view.pendingClear) {
+    bar.textContent = '🧠 ¡No coinciden! Memoriza…';
+    bar.classList.add('memorize', 'mem-bad');
+  } else if (view.status === 'finished') {
+    bar.textContent = '🏁 Partida terminada';
+  } else {
+    bar.textContent = myTurn
+      ? `🎯 Te toca · Quedan ${pairsLeft} parejas`
+      : `Turno de ${ctx.nameOf(view.turn)} · ${pairsLeft} parejas restantes`;
+  }
+  wrap.appendChild(bar);
 
-        if (state.cards.every((c) => c.matched)) {
-          state.status = 'finished';
-          let best = -1;
-          let winner = null;
-          let tie = false;
-          for (const id of state.order) {
-            if (state.scores[id] > best) { best = state.scores[id]; winner = id; tie = false; }
-            else if (state.scores[id] === best) { tie = true; }
-          }
-          state.winner = tie ? null : winner;
-        }
-        // Pareja correcta: repite turno
-        return { state };
-      }
-      // Fallo: se mostrarán y luego se ocultan; pasa el turno
-      state.pendingClear = true;
-      const i = state.order.indexOf(playerId);
-      state.turn = state.order[(i + 1) % state.order.length];
-      return { state, delayedAction: { type: '_clear', delayMs: 1100 } };
-    }
+  const grid = document.createElement('div');
+  grid.className = 'mem-grid' + (view.pendingClear ? ' mem-shake-once' : '');
+  if (view.pendingClear) setTimeout(() => shake(grid), 50);
 
-    return { state };
-  },
+  view.cards.forEach((card, i) => {
+    const c = document.createElement('button');
+    c.type = 'button';
+    c.className = 'mem-card';
+    const isUp = card.faceUp || card.matched;
+    if (isUp) c.classList.add('up');
+    if (card.matched) c.classList.add('matched');
+    c.innerHTML = `
+      <div class="mem-inner">
+        <div class="mem-face mem-front">✨</div>
+        <div class="mem-face mem-back">${card.value || ''}</div>
+      </div>`;
+    const clickable = myTurn && !card.matched && !card.faceUp && !view.pendingClear;
+    c.disabled = !clickable;
+    c.addEventListener('click', () => send({ type: 'flip', index: i }));
+    if (card.matched && !prevMatched.has(i)) sparks(c, '✨', 3);
+    else if (isUp && !card.matched && prevSnapshot && prevSnapshot[i * 2] === '0') pop(c);
+    grid.appendChild(c);
+  });
+  wrap.appendChild(grid);
+  root.appendChild(wrap);
 
-  bots(state, botIds) {
-    if (state.status !== 'playing' || state.pendingClear) return [];
-    if (!botIds.has(state.turn)) return [];
-    if (state.flipped.length >= 2) return [];
+  prevMatched = new Set(view.cards.map((c, i) => (c.matched ? i : null)).filter((x) => x !== null));
 
-    const hidden = (i) => !state.cards[i].matched && !state.cards[i].faceUp;
-    // Conocidas: cartas vistas anteriormente y aún disponibles
-    const knownByValue = {};
-    for (const i of state.seen) {
-      if (hidden(i)) (knownByValue[state.cards[i].value] ||= []).push(i);
-    }
-
-    if (state.flipped.length === 1) {
-      const v = state.cards[state.flipped[0]].value;
-      const known = (knownByValue[v] || []).find((i) => i !== state.flipped[0]);
-      if (known !== undefined) return [{ playerId: state.turn, action: { type: 'flip', index: known } }];
-      const choices = state.cards.map((_, i) => i).filter((i) => hidden(i) && i !== state.flipped[0]);
-      return choices.length ? [{ playerId: state.turn, action: { type: 'flip', index: choices[Math.floor(Math.random() * choices.length)] } }] : [];
-    }
-
-    // Primera carta: si conozco una pareja completa, empieza por ella
-    const pair = Object.values(knownByValue).find((arr) => arr.length >= 2);
-    if (pair) return [{ playerId: state.turn, action: { type: 'flip', index: pair[0] } }];
-    const choices = state.cards.map((_, i) => i).filter(hidden);
-    return choices.length ? [{ playerId: state.turn, action: { type: 'flip', index: choices[Math.floor(Math.random() * choices.length)] } }] : [];
-  },
-
-  view(state) {
-    // No se ocultan valores porque las cartas boca abajo no exponen su valor en el cliente.
-    return {
-      cards: state.cards.map((c) => ({
-        id: c.id,
-        matched: c.matched,
-        faceUp: c.faceUp,
-        matchedBy: c.matchedBy,
-        value: c.faceUp || c.matched ? c.value : null,
-      })),
-      scores: state.scores,
-      order: state.order,
-      turn: state.turn,
-      pendingClear: state.pendingClear,
-      status: state.status,
-      winner: state.winner,
-    };
-  },
-};
+  if (view.status === 'finished' && prevStatus !== 'finished') {
+    if (view.winner === me) { SFX.gameWin(ctx.meta.id); celebrate(wrap, '🎉', 36); }
+    else if (view.winner) SFX.gameLose(ctx.meta.id);
+  }
+  if (myTurn && !view.pendingClear) inviteTurn(bar);
+  prevStatus = view.status;
+}

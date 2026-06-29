@@ -1,117 +1,149 @@
-// Ahorcado - 2 a 6 jugadores por turnos
-import { randomWord } from './data/words.js';
+import { SFX } from '../sfx.js';
+import { celebrate, inviteTurn, pop, shake, sparks } from '../gameFx.js';
 
-const MAX_WRONG = 7;
-const ALPHABET = 'ABCDEFGHIJKLMNÑOPQRSTUVWXYZ';
+const ALPHABET = 'ABCDEFGHIJKLMNÑOPQRSTUVWXYZ'.split('');
+let prevWrongLen = 0;
+let prevLastResult = null;
+let prevMask = null;
+let prevStatus = null;
 
-function topScorer(scores, order) {
-  let best = -1, winner = null, tie = false;
-  for (const id of order) {
-    if (scores[id] > best) { best = scores[id]; winner = id; tie = false; }
-    else if (scores[id] === best) tie = true;
+export default function render(ctx) {
+  const { view, send, me, root } = ctx;
+  const myTurn = view.turn === me && view.status === 'playing';
+
+  root.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'hang-wrap';
+  if (view.wrong.length >= view.maxWrong - 2 && view.status === 'playing') wrap.classList.add('hang-danger');
+
+  const top = document.createElement('div');
+  top.className = 'hang-top';
+  const svg = hangmanSvg(view.wrong.length, view.maxWrong);
+  top.appendChild(svg);
+  const info = document.createElement('div');
+  info.className = 'hang-info';
+  info.innerHTML = `
+    <div class="hang-cat">📁 ${escapeHtml(view.category)}</div>
+    <div class="hang-lives">Fallos: <strong>${view.wrong.length}</strong> / ${view.maxWrong}</div>
+    <div class="hang-tip">✨ Acierto = puntos × letras · Fallo = pierdes turno</div>
+    <div class="hang-wrong">${view.wrong.map((l) => `<span>${l}</span>`).join('') || '<span class="muted">Sin fallos aún</span>'}</div>`;
+  top.appendChild(info);
+  wrap.appendChild(top);
+
+  if (view.wrong.length > prevWrongLen && view.status === 'playing') {
+    SFX.hangPart();
+    shake(svg);
   }
-  return tie ? null : winner;
+
+  const wordEl = document.createElement('div');
+  wordEl.className = 'hang-word';
+  view.mask.forEach((ch, i) => {
+    if (ch === ' ') {
+      const sp = document.createElement('span');
+      sp.className = 'hang-space';
+      wordEl.appendChild(sp);
+      return;
+    }
+    const tile = document.createElement('span');
+    tile.className = 'hang-tile' + (ch ? ' filled' : '');
+    tile.textContent = ch || '';
+    if (ch && prevMask && !prevMask[i] && ch !== ' ') {
+      pop(tile);
+      SFX.hangGood();
+      sparks(tile, '⭐', 3);
+    }
+    wordEl.appendChild(tile);
+  });
+  wrap.appendChild(wordEl);
+
+  if (view.status === 'finished' && view.word) {
+    const fin = document.createElement('p');
+    fin.className = 'hang-final-word';
+    fin.innerHTML = view.winner === me
+      ? `🎉 ¡Palabra completada! Era: <strong>${escapeHtml(view.word)}</strong>`
+      : `💀 Se acabaron las vidas. La palabra era: <strong>${escapeHtml(view.word)}</strong>`;
+    wrap.appendChild(fin);
+    if (prevStatus !== 'finished') {
+      if (view.winner === me) { SFX.gameWin(ctx.meta.id); celebrate(wrap, '🎉', 32); }
+      else SFX.gameLose(ctx.meta.id);
+    }
+  }
+
+  if (view.lastResult && view.status === 'playing') {
+    const lrKey = `${view.lastResult.by}:${view.lastResult.letter}:${view.lastResult.hit}`;
+    if (lrKey !== prevLastResult && !view.lastResult.hit) {
+      SFX.hangBad();
+      shake(wrap);
+      prevLastResult = lrKey;
+    } else if (lrKey !== prevLastResult) {
+      prevLastResult = lrKey;
+    }
+    const lr = document.createElement('p');
+    lr.className = 'hang-last' + (view.lastResult.hit ? ' good' : ' bad');
+    const who = view.lastResult.by === me ? 'Tú' : ctx.nameOf(view.lastResult.by);
+    lr.textContent = view.lastResult.hit
+      ? `✅ ${who} acertó «${view.lastResult.letter}» (+${view.lastResult.count} pts)`
+      : `❌ ${who} falló con «${view.lastResult.letter}»`;
+    wrap.appendChild(lr);
+  }
+
+  const kb = document.createElement('div');
+  kb.className = 'hang-keyboard';
+  ALPHABET.forEach((letter) => {
+    const used = view.guessed.includes(letter);
+    const wrong = view.wrong.includes(letter);
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'hang-key' + (used ? ' good' : '') + (wrong ? ' bad' : '');
+    b.textContent = letter;
+    b.disabled = used || wrong || !myTurn;
+    b.addEventListener('click', () => send({ type: 'guess', letter }));
+    kb.appendChild(b);
+  });
+  wrap.appendChild(kb);
+  wrap.appendChild(scoreRow(ctx, view.scores, view.order, view.turn));
+  root.appendChild(wrap);
+
+  if (myTurn) inviteTurn(wrap.querySelector('.hang-cat'));
+  prevWrongLen = view.wrong.length;
+  prevMask = [...view.mask];
+  prevStatus = view.status;
 }
 
-export default {
-  meta: {
-    id: 'hangman',
-    name: 'Ahorcado',
-    emoji: '🔤',
-    tagline: 'Adivina la palabra por turnos',
-    description: 'Por turnos, decid una letra. Acertar suma puntos y repite turno; fallar dibuja el ahorcado. ¡Completad la palabra antes de quedaros sin intentos!',
-    minPlayers: 2,
-    maxPlayers: 6,
-    gradient: 'linear-gradient(135deg, #f97316, #db2777)',
-  },
+function scoreRow(ctx, scores, order, turn) {
+  const row = document.createElement('div');
+  row.className = 'mem-scores';
+  order.forEach((id) => {
+    const { color, initials } = ctx.avatarFor(id, ctx.nameOf(id));
+    const s = document.createElement('div');
+    s.className = 'mem-score' + (turn === id ? ' turn' : '');
+    s.innerHTML = `<span class="avatar" style="width:26px;height:26px;font-size:.8rem;background:${color}">${initials}</span>
+      ${escapeHtml(ctx.nameOf(id))}${id === ctx.me ? ' (Tú)' : ''} · <strong>${scores[id]}</strong>`;
+    row.appendChild(s);
+  });
+  return row;
+}
 
-  init(players) {
-    const { word, category } = randomWord();
-    const scores = {};
-    for (const p of players) scores[p.id] = 0;
-    return {
-      word,
-      category,
-      guessed: [],
-      wrong: [],
-      maxWrong: MAX_WRONG,
-      order: players.map((p) => p.id),
-      turn: players[0].id,
-      scores,
-      lastResult: null,
-      status: 'playing',
-      winner: null,
-    };
-  },
-
-  action(state, playerId, action) {
-    if (state.status !== 'playing') return { error: 'La partida ha terminado.' };
-    if (action.type !== 'guess') return { error: 'Acción no válida.' };
-    if (state.turn !== playerId) return { error: 'No es tu turno.' };
-    const letter = (action.letter || '').toUpperCase();
-    if (letter.length !== 1 || !ALPHABET.includes(letter)) return { error: 'Letra no válida.' };
-    if (state.guessed.includes(letter) || state.wrong.includes(letter)) return { error: 'Esa letra ya se ha dicho.' };
-
-    const order = state.order;
-    const idx = order.indexOf(playerId);
-
-    if (state.word.includes(letter)) {
-      state.guessed.push(letter);
-      const count = state.word.split('').filter((ch) => ch === letter).length;
-      state.scores[playerId] += count;
-      state.lastResult = { by: playerId, letter, hit: true, count };
-
-      const revealed = state.word.split('').every((ch) => !ALPHABET.includes(ch) || state.guessed.includes(ch));
-      if (revealed) {
-        state.status = 'finished';
-        state.winner = topScorer(state.scores, order);
-      }
-      // Acierto: repite turno
-      return { state };
-    }
-
-    state.wrong.push(letter);
-    state.lastResult = { by: playerId, letter, hit: false };
-    if (state.wrong.length >= state.maxWrong) {
-      state.status = 'finished';
-      state.winner = topScorer(state.scores, order);
-      state.revealWord = true;
-      return { state };
-    }
-    // Fallo: pasa turno
-    state.turn = order[(idx + 1) % order.length];
-    return { state };
-  },
-
-  view(state) {
-    const finished = state.status === 'finished';
-    const mask = state.word.split('').map((ch) => {
-      if (!ALPHABET.includes(ch)) return ch;
-      return state.guessed.includes(ch) || finished ? ch : null;
-    });
-    return {
-      mask,
-      category: state.category,
-      guessed: state.guessed,
-      wrong: state.wrong,
-      maxWrong: state.maxWrong,
-      turn: state.turn,
-      scores: state.scores,
-      order: state.order,
-      lastResult: state.lastResult,
-      status: state.status,
-      winner: state.winner,
-      word: finished ? state.word : null,
-    };
-  },
-
-  bots(state, botIds) {
-    if (state.status !== 'playing' || !botIds.has(state.turn)) return [];
-    const freq = 'EAOSRNIDLCTUMPBGVYQHFZJÑXKW'.split('');
-    const used = new Set([...state.guessed, ...state.wrong]);
-    let letter = freq.find((l) => !used.has(l));
-    if (!letter) letter = ALPHABET.split('').find((l) => !used.has(l));
-    if (!letter) return [];
-    return [{ playerId: state.turn, action: { type: 'guess', letter } }];
-  },
-};
+function hangmanSvg(wrong, max) {
+  const parts = Math.min(Math.max(wrong, 0), max);
+  const show = (n) => (parts >= n ? '1' : '0.08');
+  const div = document.createElement('div');
+  div.innerHTML = `
+  <svg class="hang-svg" viewBox="0 0 140 160" width="140" height="160">
+    <g stroke="#9aa3c4" stroke-width="5" fill="none" stroke-linecap="round">
+      <line x1="15" y1="150" x2="95" y2="150"/>
+      <line x1="40" y1="150" x2="40" y2="15"/>
+      <line x1="40" y1="15" x2="95" y2="15"/>
+      <line x1="95" y1="15" x2="95" y2="32"/>
+    </g>
+    <g stroke="#ff8fb0" stroke-width="4" fill="none" stroke-linecap="round">
+      <circle cx="95" cy="45" r="13" stroke-opacity="${show(1)}"/>
+      <line x1="95" y1="58" x2="95" y2="100" stroke-opacity="${show(2)}"/>
+      <line x1="95" y1="68" x2="78" y2="88" stroke-opacity="${show(3)}"/>
+      <line x1="95" y1="68" x2="112" y2="88" stroke-opacity="${show(4)}"/>
+      <line x1="95" y1="100" x2="80" y2="125" stroke-opacity="${show(5)}"/>
+      <line x1="95" y1="100" x2="110" y2="125" stroke-opacity="${show(6)}"/>
+    </g>
+  </svg>`;
+  return div.firstElementChild;
+}

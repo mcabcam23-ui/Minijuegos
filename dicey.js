@@ -1,163 +1,112 @@
-// Dice Duel — 2 jugadores, mejor de 5 rondas
-const ROUNDS_TO_WIN = 3;
-const REROLLS = 2;
+import { SFX } from '../sfx.js';
+import { celebrate, inviteTurn, sparks } from '../gameFx.js';
+import { buildScoreChip } from './shared.js';
 
-function rollDie() {
-  return 1 + Math.floor(Math.random() * 6);
+let liveRoot = null;
+let prevStatus = null;
+let prevPhase = null;
+let lastCtx = null;
+
+export default function render(ctx) {
+  lastCtx = ctx;
+  const { view, send, me, root } = ctx;
+  const oppId = Object.keys(view.roundWins).find((id) => id !== me);
+  const rolling = view.phase === 'rolling' && view.status === 'playing';
+
+  if (!liveRoot || !root.contains(liveRoot)) {
+    root.innerHTML = '';
+    liveRoot = document.createElement('div');
+    liveRoot.className = 'dy-wrap';
+    liveRoot.innerHTML = `
+      <div class="dy-head"></div>
+      <p class="dy-round"></p>
+      <div class="dy-dice"></div>
+      <p class="dy-sum"></p>
+      <div class="dy-actions">
+        <button type="button" class="btn btn-ghost dy-roll">🎲 Relanzar</button>
+        <button type="button" class="btn btn-primary dy-stand">✓ Confirmar</button>
+      </div>
+      <div class="dy-reveal" hidden></div>
+      <p class="dy-hint"></p>`;
+    root.appendChild(liveRoot);
+
+    liveRoot.querySelector('.dy-roll').addEventListener('click', () => {
+      const c = lastCtx;
+      if (!c || c.view.locked) return;
+      c.send({ type: 'roll' });
+      SFX.dyRoll();
+    });
+    liveRoot.querySelector('.dy-stand').addEventListener('click', () => {
+      const c = lastCtx;
+      if (!c || c.view.locked) return;
+      c.send({ type: 'stand' });
+      SFX.dyLock();
+    });
+  }
+
+  const head = liveRoot.querySelector('.dy-head');
+  head.innerHTML = '';
+  head.appendChild(buildScoreChip(ctx, me, `${view.roundWins[me]}/${view.target}`, rolling && !view.locked));
+  if (oppId) head.appendChild(buildScoreChip(ctx, oppId, `${view.roundWins[oppId]}/${view.target}`, false));
+
+  liveRoot.querySelector('.dy-round').textContent = `Ronda ${view.round} · Relanzos: ${view.rerollsLeft}`;
+
+  const diceEl = liveRoot.querySelector('.dy-dice');
+  diceEl.innerHTML = '';
+  (view.dice || []).forEach((v, i) => {
+    const d = document.createElement('button');
+    d.type = 'button';
+    d.className = 'dy-die' + (view.holds[i] ? ' held' : '');
+    d.textContent = v;
+    d.disabled = view.locked || !rolling;
+    d.addEventListener('click', () => {
+      if (view.locked || !rolling) return;
+      send({ type: 'toggleHold', index: i });
+      SFX.dyHold();
+    });
+    diceEl.appendChild(d);
+  });
+
+  const sum = (view.dice || []).reduce((a, b) => a + b, 0);
+  liveRoot.querySelector('.dy-sum').textContent = `Suma: ${sum}`;
+
+  const rollBtn = liveRoot.querySelector('.dy-roll');
+  const standBtn = liveRoot.querySelector('.dy-stand');
+  rollBtn.disabled = view.locked || !rolling || view.rerollsLeft <= 0;
+  standBtn.disabled = view.locked || !rolling;
+
+  const reveal = liveRoot.querySelector('.dy-reveal');
+  const hint = liveRoot.querySelector('.dy-hint');
+
+  if (view.phase === 'reveal' && view.roundResult) {
+    reveal.hidden = false;
+    const rr = view.roundResult;
+    const mySum = rr.sums[me];
+    const oppSum = oppId ? rr.sums[oppId] : 0;
+    reveal.innerHTML = `
+      <p>Tu suma: <strong>${mySum}</strong> · Rival: <strong>${oppSum}</strong></p>
+      <p>${rr.winner === me ? '🎉 ¡Ganas la ronda!' : rr.winner ? '😬 Gana la ronda el rival' : '🤝 Empate de ronda'}</p>`;
+    if (prevPhase !== 'reveal') {
+      if (rr.winner === me) { SFX.dyWinRound(); sparks(liveRoot, '⭐', 4); }
+      else if (rr.winner) SFX.dyLoseRound();
+    }
+  } else {
+    reveal.hidden = true;
+  }
+
+  if (view.status === 'finished') {
+    hint.textContent = view.winner === me ? '🏆 ¡Campeón de dados!' : `Ganó ${ctx.nameOf(view.winner)}`;
+    if (prevStatus !== 'finished') {
+      if (view.winner === me) { SFX.gameWin(ctx.meta.id); celebrate(liveRoot, '🏆', 44); }
+      else SFX.gameLose(ctx.meta.id);
+    }
+  } else if (view.locked) {
+    hint.textContent = view.oppLocked ? '⏳ Revelando…' : '✓ Confirmado — esperando rival';
+  } else if (rolling) {
+    hint.textContent = '🎲 Retén dados y relanza o confirma';
+    inviteTurn(hint);
+  }
+
+  prevPhase = view.phase;
+  prevStatus = view.status;
 }
-
-function rollAll() {
-  return Array.from({ length: 5 }, rollDie);
-}
-
-function sum(dice) {
-  return dice.reduce((a, b) => a + b, 0);
-}
-
-export default {
-  meta: {
-    id: 'dicey',
-    name: 'Dados Duelo',
-    emoji: '🎲',
-    tagline: 'Suma máxima con 5 dados',
-    description: 'Lanza 5 dados, retén los que quieras y vuelve a tirar. Gana la ronda quien sume más. ¡Primero a 3 rondas!',
-    minPlayers: 2,
-    maxPlayers: 2,
-    gradient: 'linear-gradient(135deg, #eab308, #f97316)',
-  },
-
-  init(players) {
-    const roundWins = {};
-    const dice = {};
-    const holds = {};
-    const rerollsLeft = {};
-    const locked = {};
-    for (const p of players) {
-      roundWins[p.id] = 0;
-      dice[p.id] = rollAll();
-      holds[p.id] = [false, false, false, false, false];
-      rerollsLeft[p.id] = REROLLS;
-      locked[p.id] = false;
-    }
-    return {
-      order: players.map((p) => p.id),
-      roundWins,
-      round: 1,
-      dice,
-      holds,
-      rerollsLeft,
-      locked,
-      phase: 'rolling',
-      lastRoll: null,
-      roundResult: null,
-      status: 'playing',
-      winner: null,
-    };
-  },
-
-  action(state, playerId, action) {
-    if (state.status !== 'playing' && action.type !== '_nextRound') {
-      return { error: 'La partida ha terminado.' };
-    }
-    if (state.phase === 'reveal' && action.type !== '_nextRound') {
-      return { error: 'Espera el resultado de la ronda.' };
-    }
-
-    if (action.type === '_nextRound') {
-      if (state.status === 'finished') return { state };
-      for (const id of state.order) {
-        state.dice[id] = rollAll();
-        state.holds[id] = [false, false, false, false, false];
-        state.rerollsLeft[id] = REROLLS;
-        state.locked[id] = false;
-      }
-      state.round += 1;
-      state.phase = 'rolling';
-      state.roundResult = null;
-      state.lastRoll = null;
-      return { state };
-    }
-
-    if (action.type === 'toggleHold') {
-      if (state.locked[playerId]) return { error: 'Ya has confirmado.' };
-      const i = action.index;
-      if (typeof i !== 'number' || i < 0 || i > 4) return { error: 'Dado no válido.' };
-      state.holds[playerId][i] = !state.holds[playerId][i];
-      return { state };
-    }
-
-    if (action.type === 'roll') {
-      if (state.locked[playerId]) return { error: 'Ya has confirmado.' };
-      if (state.rerollsLeft[playerId] <= 0) return { error: 'Sin relanzamientos.' };
-      const d = state.dice[playerId];
-      for (let i = 0; i < 5; i++) {
-        if (!state.holds[playerId][i]) d[i] = rollDie();
-      }
-      state.rerollsLeft[playerId] -= 1;
-      state.lastRoll = { by: playerId };
-      return { state };
-    }
-
-    if (action.type === 'stand') {
-      if (state.locked[playerId]) return { error: 'Ya has confirmado.' };
-      state.locked[playerId] = true;
-
-      if (state.order.every((id) => state.locked[id])) {
-        const [a, b] = state.order;
-        const sa = sum(state.dice[a]);
-        const sb = sum(state.dice[b]);
-        let roundWinner = null;
-        if (sa > sb) roundWinner = a;
-        else if (sb > sa) roundWinner = b;
-        if (roundWinner) state.roundWins[roundWinner] += 1;
-
-        state.roundResult = {
-          sums: { [a]: sa, [b]: sb },
-          winner: roundWinner,
-          dice: { [a]: [...state.dice[a]], [b]: [...state.dice[b]] },
-        };
-        state.phase = 'reveal';
-
-        if (state.roundWins[a] >= ROUNDS_TO_WIN || state.roundWins[b] >= ROUNDS_TO_WIN) {
-          state.status = 'finished';
-          state.winner = state.roundWins[a] >= ROUNDS_TO_WIN ? a : b;
-        }
-        return { state, delayedAction: { type: '_nextRound', delayMs: 2800 } };
-      }
-      return { state };
-    }
-
-    return { error: 'Acción no válida.' };
-  },
-
-  view(state, playerId) {
-    const opp = state.order.find((id) => id !== playerId);
-    return {
-      round: state.round,
-      roundWins: state.roundWins,
-      dice: state.dice[playerId],
-      holds: state.holds[playerId],
-      rerollsLeft: state.rerollsLeft[playerId],
-      locked: state.locked[playerId],
-      oppLocked: opp ? state.locked[opp] : false,
-      phase: state.phase,
-      roundResult: state.roundResult,
-      status: state.status,
-      winner: state.winner,
-      target: ROUNDS_TO_WIN,
-    };
-  },
-
-  bots(state, botIds) {
-    if (state.status !== 'playing') return [];
-    if (state.phase === 'reveal') return [];
-    for (const id of state.order) {
-      if (!botIds.has(id) || state.locked[id]) continue;
-      if (state.rerollsLeft[id] > 0 && sum(state.dice[id]) < 18) {
-        return [{ playerId: id, action: { type: 'roll' } }];
-      }
-      return [{ playerId: id, action: { type: 'stand' } }];
-    }
-    return [];
-  },
-};

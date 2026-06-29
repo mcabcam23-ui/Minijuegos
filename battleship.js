@@ -1,429 +1,839 @@
-// Tocado y Hundido — variante española (plantilla clásica)
-// 1×4, 2×3, 3×2, 4×1 = 20 casillas
+import { SFX } from '../sfx.js';
+import { celebrate } from '../gameFx.js';
+import { renderVerbal, resetVerbalState } from './battleship-verbal.js';
+
 const SIZE = 10;
 const ROWS = 'ABCDEFGHIJ'.split('');
-const FLEET = [
-  { id: 'b4', name: 'Acorazado', size: 4, count: 1 },
-  { id: 'c3', name: 'Crucero', size: 3, count: 2 },
-  { id: 'd2', name: 'Destructor', size: 2, count: 3 },
-  { id: 's1', name: 'Submarino', size: 1, count: 4 },
-];
+const SCAN_MS = 1000;
 
-// Plantilla expandida (10 barcos individuales)
-const SHIP_TEMPLATE = FLEET.flatMap((f) =>
-  Array.from({ length: f.count }, (_, i) => ({
-    id: `${f.id}_${i}`,
-    name: f.count > 1 ? `${f.name} ${i + 1}` : f.name,
-    size: f.size,
-    type: f.id,
-  }))
-);
-
+let placed = null;
+let orientation = 'h';
+let selected = 0;
+let prevPhase = null;
+let fleet = null;
+let battleCtx = null;
+let pendingShots = new Map();
+let snapshotIncoming = {};
+let snapshotEnemyShots = {};
+let battleFxReady = false;
+/** Casillas que deben seguir como "tocado" hasta revelar el disparo que hundió el barco. */
+let deferSunkUntil = new Map();
 function key(x, y) { return `${x},${y}`; }
-function coordLabel(x, y) { return `${ROWS[y]}${x + 1}`; }
+function label(x, y) { return `${ROWS[y]}${x + 1}`; }
 
-function validatePlacement(ships) {
-  if (!Array.isArray(ships)) return 'Colocación no válida.';
-  const expected = SHIP_TEMPLATE.map((s) => s.size).sort((a, b) => a - b).join(',');
-  const got = ships.map((s) => (s.cells ? s.cells.length : -1)).sort((a, b) => a - b).join(',');
-  if (expected !== got) return 'La flota no coincide con la plantilla.';
+function cellsFor(x, y, size, orient) {
+  const cells = [];
+  for (let i = 0; i < size; i++) cells.push(orient === 'h' ? { x: x + i, y } : { x, y: y + i });
+  return cells;
+}
 
-  const occupied = new Set();
-  for (const ship of ships) {
-    const cells = ship.cells;
-    if (!Array.isArray(cells) || cells.length < 1) return 'Barco no válido.';
-    for (const c of cells) {
-      if (typeof c.x !== 'number' || typeof c.y !== 'number' || c.x < 0 || c.y < 0 || c.x >= SIZE || c.y >= SIZE) {
-        return 'Barco fuera del tablero.';
-      }
+function occupiedSet(except = -1) {
+  const set = new Set();
+  placed.forEach((cells, i) => { if (cells && i !== except) cells.forEach((c) => set.add(key(c.x, c.y))); });
+  return set;
+}
+
+function isValid(cells, except = -1) {
+  if (!cells.every((c) => c.x >= 0 && c.y >= 0 && c.x < SIZE && c.y < SIZE)) return false;
+  const occ = occupiedSet(except);
+  return cells.every((c) => !occ.has(key(c.x, c.y)));
+}
+
+function randomize() {
+  placed = fleet.map(() => null);
+  fleet.forEach((ship, i) => {
+    for (let t = 0; t < 600; t++) {
+      const orient = Math.random() < 0.5 ? 'h' : 'v';
+      const x = Math.floor(Math.random() * SIZE);
+      const y = Math.floor(Math.random() * SIZE);
+      const cells = cellsFor(x, y, ship.size, orient);
+      if (isValid(cells, i)) { placed[i] = cells; break; }
     }
-    if (cells.length > 1) {
-      const xs = cells.map((c) => c.x);
-      const ys = cells.map((c) => c.y);
-      const sameRow = ys.every((y) => y === ys[0]);
-      const sameCol = xs.every((x) => x === xs[0]);
-      if (!sameRow && !sameCol) return 'Los barcos deben ser rectos.';
-      if (sameRow) {
-        const sorted = [...xs].sort((a, b) => a - b);
-        for (let i = 1; i < sorted.length; i++) if (sorted[i] !== sorted[i - 1] + 1) return 'Barco no contiguo.';
-      } else {
-        const sorted = [...ys].sort((a, b) => a - b);
-        for (let i = 1; i < sorted.length; i++) if (sorted[i] !== sorted[i - 1] + 1) return 'Barco no contiguo.';
-      }
+  });
+  selected = placed.findIndex((c) => !c);
+  if (selected < 0) selected = 0;
+}
+
+function ensureInit(ctx) {
+  fleet = ctx.meta.fleet;
+  if (prevPhase && prevPhase !== 'placement' && ctx.view.phase === 'placement') {
+    placed = null;
+    placementLive = null;
+    placementGrid = null;
+    resetShotFx();
+  }
+  if (!placed || placed.length !== fleet.length) {
+    placed = fleet.map(() => null);
+    orientation = 'h';
+    selected = 0;
+  }
+}
+
+function resetShotFx() {
+  pendingShots.forEach((p) => { if (p.timer) clearTimeout(p.timer); });
+  pendingShots.clear();
+  snapshotIncoming = {};
+  snapshotEnemyShots = {};
+  deferSunkUntil.clear();
+  battleFxReady = false;
+  resetVerbalState();
+}
+
+function shotPk(board, x, y) {
+  return `${board}:${key(x, y)}`;
+}
+
+function pruneDeferSunk() {
+  for (const [cellK, holdPk] of deferSunkUntil) {
+    const hp = pendingShots.get(holdPk);
+    if (!hp || hp.revealed) deferSunkUntil.delete(cellK);
+  }
+}
+
+function applySunkDefer(view, pk, triggerK) {
+  const sunkCell = (view.sunkEnemyCells || []).find((c) => key(c.x, c.y) === triggerK);
+  if (!sunkCell?.name) return;
+  for (const c of view.sunkEnemyCells) {
+    if (c.name === sunkCell.name) deferSunkUntil.set(key(c.x, c.y), pk);
+  }
+}
+
+function syncShotsFromView(view) {
+  const enemyShots = view.enemyShots || {};
+  const incoming = view.myIncoming || {};
+
+  if (!battleFxReady) {
+    snapshotEnemyShots = { ...enemyShots };
+    snapshotIncoming = { ...incoming };
+    battleFxReady = true;
+    return;
+  }
+
+  pruneDeferSunk();
+  const sunkSet = new Set((view.sunkEnemyCells || []).map((c) => key(c.x, c.y)));
+
+  for (const k of Object.keys(enemyShots)) {
+    const prev = snapshotEnemyShots[k];
+    const cur = enemyShots[k];
+    const isNew = !prev;
+    const upgradedToSunk = prev === 'hit' && cur === 'sunk';
+
+    if (!isNew && !upgradedToSunk) continue;
+
+    const [x, y] = k.split(',').map(Number);
+    const pk = shotPk('fire', x, y);
+    let p = pendingShots.get(pk);
+    if (!p) {
+      p = { board: 'fire', x, y, started: Date.now(), result: null, revealed: false, timer: null };
+      pendingShots.set(pk, p);
     }
-    for (const c of cells) {
-      const k = key(c.x, c.y);
-      if (occupied.has(k)) return 'Los barcos se solapan.';
-      occupied.add(k);
+    if (isNew) {
+      p.result = sunkSet.has(k) || cur === 'sunk' ? 'sunk' : cur;
+      if (sunkSet.has(k) || cur === 'sunk') applySunkDefer(view, pk, k);
+      scheduleReveal(pk);
+    } else if (upgradedToSunk) {
+      const active = [...pendingShots.values()].find((entry) => entry.board === 'fire' && !entry.revealed);
+      const holdPk = active ? shotPk('fire', active.x, active.y) : pk;
+      applySunkDefer(view, holdPk, k);
     }
   }
-  return null;
-}
 
-function isHitMark(v) {
-  return v === 'hit' || v === 'sunk';
-}
-
-function allSunk(board) {
-  return board.ships.every((ship) => ship.cells.every((c) => isHitMark(board.incoming[key(c.x, c.y)])));
-}
-
-function shipSunk(ship, incoming) {
-  return ship.cells.every((c) => isHitMark(incoming[key(c.x, c.y)]));
-}
-
-function shipStatusList(ships, incoming) {
-  if (!ships) return [];
-  return ships.map((ship) => {
-    const hits = ship.cells.filter((c) => isHitMark(incoming[key(c.x, c.y)])).length;
-    return { id: ship.id, name: ship.name, size: ship.cells.length, hits, sunk: hits === ship.cells.length };
-  });
-}
-
-function countManualSunk(fleetHits = {}) {
-  return SHIP_TEMPLATE.filter((s) => (fleetHits[s.id] || 0) >= s.size).length;
-}
-
-function manualFleetStatus(fleetHits = {}) {
-  return SHIP_TEMPLATE.map((ship) => {
-    const hits = Math.max(0, Math.min(ship.size, fleetHits[ship.id] || 0));
-    return { id: ship.id, name: ship.name, size: ship.size, hits, sunk: hits >= ship.size };
-  });
-}
-
-function initManualPlayer() {
-  return { enemyMarks: {}, ownMarks: {}, fleetHits: {}, lastMark: null };
-}
-
-function initVerbal(players) {
-  const manual = {};
-  for (const p of players) manual[p.id] = initManualPlayer();
-  return {
-    playMode: 'verbal',
-    phase: 'battle',
-    manual,
-    order: players.map((p) => p.id),
-    turn: null,
-    status: 'playing',
-    winner: null,
-  };
-}
-
-export default {
-  meta: {
-    id: 'battleship',
-    name: 'Tocado y Hundido',
-    emoji: '🚢',
-    tagline: 'Hunde toda la flota enemiga',
-    description: 'Coloca tu flota en el tablero o juega en modo verbal: comunicad las coordenadas en voz y marcáis agua, tocado y hundido a mano.',
-    modes: [
-      { id: 'digital', name: 'Digital', emoji: '🖥️', hint: 'Colocación y disparos en la app' },
-      { id: 'verbal', name: 'Verbal', emoji: '🗣️', hint: 'Hablad las coordenadas y marcáis el resultado a mano' },
-    ],
-    minPlayers: 2,
-    maxPlayers: 2,
-    gradient: 'linear-gradient(135deg, #0ea5e9, #2563eb)',
-    fleet: SHIP_TEMPLATE,
-    fleetGroups: FLEET,
-    boardSize: SIZE,
-    rows: ROWS,
-  },
-
-  init(players, options = {}) {
-    if (options.playMode === 'verbal') return initVerbal(players);
-
-    const boards = {};
-    for (const p of players) boards[p.id] = { ships: null, ready: false, incoming: {} };
-    return {
-      playMode: 'digital',
-      phase: 'placement',
-      boards,
-      order: players.map((p) => p.id),
-      turn: null,
-      status: 'playing',
-      winner: null,
-      lastShot: null,
-    };
-  },
-
-  action(state, playerId, action) {
-    if (state.status !== 'playing') return { error: 'La partida ha terminado.' };
-
-    if (state.playMode === 'verbal') {
-      return actionVerbal(state, playerId, action);
+  for (const k of Object.keys(incoming)) {
+    if (snapshotIncoming[k]) continue;
+    const [x, y] = k.split(',').map(Number);
+    const pk = shotPk('own', x, y);
+    let p = pendingShots.get(pk);
+    if (!p) {
+      p = { board: 'own', x, y, started: Date.now(), result: null, revealed: false, timer: null };
+      pendingShots.set(pk, p);
     }
+    p.result = incoming[k];
+    scheduleReveal(pk);
+  }
 
-    if (action.type === 'placeShips') {
-      if (state.phase !== 'placement') return { error: 'Ya no puedes colocar barcos.' };
-      const err = validatePlacement(action.ships);
-      if (err) return { error: err };
-      const board = state.boards[playerId];
-      board.ships = action.ships.map((s, i) => ({
-        id: SHIP_TEMPLATE[i].id,
-        name: SHIP_TEMPLATE[i].name,
-        size: SHIP_TEMPLATE[i].size,
-        cells: s.cells.map((c) => ({ x: c.x, y: c.y })),
-      }));
-      board.ready = true;
-      if (state.order.every((id) => state.boards[id].ready)) {
-        state.phase = 'battle';
-        state.turn = state.order[0];
-      }
-      return { state };
+  snapshotEnemyShots = { ...enemyShots };
+  snapshotIncoming = { ...incoming };
+}
+
+function scheduleReveal(pk) {
+  const p = pendingShots.get(pk);
+  if (!p || p.revealed || p.result == null || p.timer) return;
+  const delay = Math.max(0, SCAN_MS - (Date.now() - p.started));
+  p.timer = setTimeout(() => {
+    p.revealed = true;
+    p.timer = null;
+    for (const [cellK, holdPk] of deferSunkUntil) {
+      if (holdPk === pk) deferSunkUntil.delete(cellK);
     }
+    if (p.result === 'sunk') SFX.bsSunk();
+    else if (p.result === 'hit') SFX.bsHit();
+    else if (p.result === 'miss') SFX.bsMiss();
+    if (battleCtx) renderBattle(battleCtx);
+  }, delay);
+}
 
-    if (action.type === 'fire') {
-      if (state.phase !== 'battle') return { error: 'Aún no empieza la batalla.' };
-      if (state.turn !== playerId) return { error: 'No es tu turno.' };
-      const { x, y } = action;
-      if (typeof x !== 'number' || typeof y !== 'number' || x < 0 || y < 0 || x >= SIZE || y >= SIZE) {
-        return { error: 'Coordenada no válida.' };
-      }
-      const enemyId = state.order.find((id) => id !== playerId);
-      const enemy = state.boards[enemyId];
+function hasActiveScan() {
+  return [...pendingShots.values()].some((p) => !p.revealed);
+}
+
+function startLocalFire(x, y, send) {
+  const pk = shotPk('fire', x, y);
+  if (pendingShots.has(pk) || hasActiveScan()) return false;
+  pendingShots.set(pk, {
+    board: 'fire', x, y, started: Date.now(), result: null, revealed: false, timer: null,
+  });
+  send({ type: 'fire', x, y });
+  return true;
+}
+
+function paintShotCell(cell, board, x, y, { shots, incoming, sunkSet, shipSet, shipTiny }) {
+  const visual = getCellVisual(board, x, y, { shots, incoming, sunkSet, shipSet, shipTiny });
+  return applyCellVisual(cell, visual, board);
+}
+
+function getCellVisual(board, x, y, { shots, incoming, sunkSet, shipSet, shipTiny }) {
+  const k = key(x, y);
+  const pk = shotPk(board, x, y);
+  const pending = pendingShots.get(pk);
+  if (pending && !pending.revealed) return 'scan';
+
+  const shot = board === 'fire' ? shots?.[k] : incoming?.[k];
+  const isSunk = shot === 'sunk' || sunkSet?.has(k);
+  const holdPk = deferSunkUntil.get(k);
+  const holdPending = holdPk ? pendingShots.get(holdPk) : null;
+  const deferSunk = deferSunkUntil.has(k) && !!(holdPending && !holdPending.revealed);
+
+  if (isSunk && !deferSunk) return 'sunk';
+  if (shot === 'hit' || shot === 'sunk' || (isSunk && deferSunk)) {
+    return board === 'fire' ? 'hit' : 'hit-own';
+  }
+  if (shot === 'miss') return board === 'fire' ? 'miss' : 'miss-own';
+  if (board === 'own' && shipSet?.has(k)) return shipTiny?.has(k) ? 'ship-tiny' : 'ship';
+  return 'empty';
+}
+
+function applyCellVisual(cell, visual) {
+  if (cell.dataset.visual === visual) return false;
+  const prev = cell.dataset.visual;
+  cell.dataset.visual = visual;
+  cell.className = 'bs-cell';
+  cell.replaceChildren();
+
+  switch (visual) {
+    case 'scan':
+      cell.classList.add('scanning');
+      cell.insertAdjacentHTML('beforeend', markupScanning());
+      break;
+    case 'sunk':
+      cell.classList.add('sunk');
+      if (prev === 'scan') cell.classList.add('revealed-fx');
+      cell.insertAdjacentHTML('beforeend', markupSunk());
+      break;
+    case 'hit':
+      cell.classList.add('hit');
+      if (prev === 'scan') cell.classList.add('revealed-fx');
+      cell.insertAdjacentHTML('beforeend', markupHit());
+      break;
+    case 'hit-own':
+      cell.classList.add('hit-own');
+      if (prev === 'scan') cell.classList.add('revealed-fx');
+      cell.insertAdjacentHTML('beforeend', markupHit());
+      break;
+    case 'miss':
+      cell.classList.add('miss');
+      if (prev === 'scan') cell.classList.add('revealed-fx');
+      cell.insertAdjacentHTML('beforeend', markupMiss());
+      break;
+    case 'miss-own':
+      cell.classList.add('miss-own');
+      if (prev === 'scan') cell.classList.add('revealed-fx');
+      cell.insertAdjacentHTML('beforeend', markupMiss());
+      break;
+    case 'ship-tiny':
+      cell.classList.add('ship', 'ship-tiny');
+      break;
+    case 'ship':
+      cell.classList.add('ship');
+      break;
+    default:
+      break;
+  }
+  return true;
+}
+
+function buildShipSets(ships) {
+  const shipSet = new Set();
+  const shipTiny = new Set();
+  if (ships) {
+    ships.forEach((s) => s.cells.forEach((c) => {
+      shipSet.add(key(c.x, c.y));
+      if (s.cells.length === 1) shipTiny.add(key(c.x, c.y));
+    }));
+  }
+  return { shipSet, shipTiny };
+}
+
+function refreshBoardGrid(grid, board, opts, canFire) {
+  if (!grid) return;
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const cell = grid.querySelector(`[data-x="${x}"][data-y="${y}"]`);
+      if (!cell) continue;
       const k = key(x, y);
-      if (enemy.incoming[k]) return { error: 'Ya disparaste en ' + coordLabel(x, y) + '.' };
-
-      const hitShip = enemy.ships.find((ship) => ship.cells.some((c) => c.x === x && c.y === y));
-      enemy.incoming[k] = hitShip ? 'hit' : 'miss';
-
-      let sunkName = null;
-      if (hitShip && shipSunk(hitShip, enemy.incoming)) {
-        sunkName = hitShip.name;
-        for (const c of hitShip.cells) enemy.incoming[key(c.x, c.y)] = 'sunk';
-      }
-
-      state.lastShot = {
-        by: playerId, x, y,
-        coord: coordLabel(x, y),
-        result: hitShip ? 'hit' : 'miss',
-        sunk: sunkName,
-      };
-
-      if (hitShip && allSunk(enemy)) {
-        state.status = 'finished';
-        state.phase = 'finished';
-        state.winner = playerId;
-        return { state };
-      }
-
-      if (!hitShip) state.turn = enemyId;
-      return { state };
+      const visual = getCellVisual(board, x, y, opts);
+      applyCellVisual(cell, visual);
+      const clickable = canFire && visual === 'empty';
+      cell.classList.toggle('clickable', clickable);
+      cell.toggleAttribute('data-fire', clickable);
     }
-
-    return { error: 'Acción no válida.' };
-  },
-
-  view(state, playerId) {
-    if (state.playMode === 'verbal') {
-      const manual = state.manual[playerId] || initManualPlayer();
-      const fleetStatus = manualFleetStatus(manual.fleetHits);
-      return {
-        playMode: 'verbal',
-        phase: state.phase,
-        status: state.status,
-        winner: state.winner,
-        lastMark: manual.lastMark,
-        enemyMarks: manual.enemyMarks,
-        ownMarks: manual.ownMarks,
-        enemyFleetStatus: fleetStatus,
-        sunkEnemyShips: countManualSunk(manual.fleetHits),
-        totalEnemyShips: SHIP_TEMPLATE.length,
-        stats: {
-          enemyMiss: Object.values(manual.enemyMarks).filter((v) => v === 'miss').length,
-          enemyHit: Object.values(manual.enemyMarks).filter((v) => v === 'hit').length,
-          enemySunkCells: Object.values(manual.enemyMarks).filter((v) => v === 'sunk').length,
-          ownMiss: Object.values(manual.ownMarks).filter((v) => v === 'miss').length,
-          ownHit: Object.values(manual.ownMarks).filter((v) => v === 'hit' || v === 'sunk').length,
-        },
-      };
-    }
-
-    const enemyId = state.order.find((id) => id !== playerId);
-    const me = state.boards[playerId];
-    const enemy = state.boards[enemyId];
-
-    const sunkEnemyCells = [];
-    if (enemy?.ships) {
-      for (const ship of enemy.ships) {
-        if (shipSunk(ship, enemy.incoming)) {
-          for (const c of ship.cells) sunkEnemyCells.push({ x: c.x, y: c.y, name: ship.name });
-        }
-      }
-    }
-
-    return {
-      playMode: 'digital',
-      phase: state.phase,
-      status: state.status,
-      winner: state.winner,
-      turn: state.turn,
-      lastShot: state.lastShot,
-      myReady: me?.ready ?? false,
-      enemyReady: enemy?.ready ?? false,
-      myShips: me?.ships ?? null,
-      myIncoming: me?.incoming ?? {},
-      enemyShots: enemy?.incoming ?? {},
-      sunkEnemyCells,
-      myFleetStatus: shipStatusList(me?.ships, me?.incoming ?? {}),
-      enemyFleetStatus: shipStatusList(enemy?.ships, enemy?.incoming ?? {}),
-      remainingEnemyShips: enemy?.ships ? enemy.ships.filter((s) => !shipSunk(s, enemy.incoming)).length : null,
-      remainingMyShips: me?.ships ? me.ships.filter((s) => !shipSunk(s, me.incoming)).length : null,
-    };
-  },
-
-  bots(state, botIds) {
-    if (state.playMode === 'verbal') return [];
-    if (state.status !== 'playing') return [];
-
-    if (state.phase === 'placement') {
-      for (const id of state.order) {
-        if (botIds.has(id) && !state.boards[id].ready) {
-          let ships = null;
-          for (let t = 0; t < 8 && !ships; t++) ships = randomPlacement();
-          if (!ships) return [];
-          return [{ playerId: id, action: { type: 'placeShips', ships } }];
-        }
-      }
-      return [];
-    }
-
-    if (state.phase === 'battle' && botIds.has(state.turn)) {
-      const me = state.turn;
-      const enemyId = state.order.find((id) => id !== me);
-      const incoming = state.boards[enemyId].incoming;
-      const tried = (x, y) => incoming[key(x, y)] !== undefined;
-
-      const candidates = [];
-      for (let x = 0; x < SIZE; x++) {
-        for (let y = 0; y < SIZE; y++) {
-          if (isHitMark(incoming[key(x, y)])) {
-            for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-              const nx = x + dx, ny = y + dy;
-              if (nx >= 0 && ny >= 0 && nx < SIZE && ny < SIZE && !tried(nx, ny)) {
-                let weight = 2;
-                const ox = x - dx, oy = y - dy;
-                if (ox >= 0 && oy >= 0 && ox < SIZE && oy < SIZE && incoming[key(ox, oy)] === 'hit') weight = 8;
-                candidates.push({ x: nx, y: ny, weight });
-              }
-            }
-          }
-        }
-      }
-
-      let target;
-      if (candidates.length) {
-        candidates.sort((a, b) => b.weight - a.weight);
-        const top = candidates.filter((c) => c.weight === candidates[0].weight);
-        target = top[Math.floor(Math.random() * top.length)];
-      } else {
-        const free = [];
-        for (let x = 0; x < SIZE; x++) for (let y = 0; y < SIZE; y++) if (!tried(x, y)) free.push({ x, y });
-        const parity = free.filter((c) => (c.x + c.y) % 2 === 0);
-        target = (parity.length ? parity : free)[Math.floor(Math.random() * (parity.length || free.length))];
-      }
-      if (!target) return [];
-      return [{ playerId: me, action: { type: 'fire', x: target.x, y: target.y } }];
-    }
-    return [];
-  },
-};
-
-function actionVerbal(state, playerId, action) {
-  const manual = state.manual[playerId];
-  if (!manual) return { error: 'Jugador no encontrado.' };
-
-  if (action.type === 'markCell') {
-    const board = action.board === 'own' ? 'own' : 'enemy';
-    const { x, y } = action;
-    if (typeof x !== 'number' || typeof y !== 'number' || x < 0 || y < 0 || x >= SIZE || y >= SIZE) {
-      return { error: 'Coordenada no válida.' };
-    }
-    const k = key(x, y);
-    const target = board === 'enemy' ? manual.enemyMarks : manual.ownMarks;
-    const mark = action.mark;
-
-    if (mark === 'clear' || mark === null) {
-      delete target[k];
-    } else if (mark === 'miss' || mark === 'hit' || mark === 'sunk') {
-      target[k] = mark;
-    } else {
-      return { error: 'Marca no válida.' };
-    }
-
-    manual.lastMark = {
-      board,
-      x,
-      y,
-      mark: target[k] || null,
-      coord: coordLabel(x, y),
-    };
-    return { state };
   }
-
-  if (action.type === 'markFleet') {
-    const ship = SHIP_TEMPLATE.find((s) => s.id === action.shipId);
-    if (!ship) return { error: 'Barco no válido.' };
-
-    if (action.mode === 'cycle') {
-      const cur = manual.fleetHits[ship.id] || 0;
-      const next = cur >= ship.size ? 0 : cur + 1;
-      if (next === 0) delete manual.fleetHits[ship.id];
-      else manual.fleetHits[ship.id] = next;
-    } else if (action.mode === 'sunk') {
-      manual.fleetHits[ship.id] = ship.size;
-    } else if (action.mode === 'clear') {
-      delete manual.fleetHits[ship.id];
-    } else if (typeof action.hits === 'number') {
-      const h = Math.max(0, Math.min(ship.size, Math.round(action.hits)));
-      if (h === 0) delete manual.fleetHits[ship.id];
-      else manual.fleetHits[ship.id] = h;
-    } else {
-      return { error: 'Acción de flota no válida.' };
-    }
-    return { state };
-  }
-
-  if (action.type === 'clearBoard') {
-    const board = action.board === 'own' ? 'own' : 'enemy';
-    if (board === 'enemy') manual.enemyMarks = {};
-    else manual.ownMarks = {};
-    return { state };
-  }
-
-  if (action.type === 'resetFleet') {
-    manual.fleetHits = {};
-    return { state };
-  }
-
-  return { error: 'Acción no válida.' };
 }
 
-function randomPlacement() {
-  const occ = new Set();
-  const ships = [];
-  for (const sh of SHIP_TEMPLATE) {
-    let placed = false;
-    for (let t = 0; t < 1000 && !placed; t++) {
-      const horiz = Math.random() < 0.5;
-      const x = Math.floor(Math.random() * (horiz ? SIZE - sh.size + 1 : SIZE));
-      const y = Math.floor(Math.random() * (horiz ? SIZE : SIZE - sh.size + 1));
-      const cells = [];
-      let ok = true;
-      for (let i = 0; i < sh.size; i++) {
-        const cx = horiz ? x + i : x;
-        const cy = horiz ? y : y + i;
-        const k = key(cx, cy);
-        if (occ.has(k)) { ok = false; break; }
-        cells.push({ x: cx, y: cy });
-      }
-      if (ok) {
-        cells.forEach((c) => occ.add(key(c.x, c.y)));
-        ships.push({ cells });
-        placed = true;
+function handleFireBoardClick(e) {
+  const cell = e.target.closest('.bs-cell[data-fire]');
+  if (!cell || !battleCtx) return;
+  const x = Number(cell.dataset.x);
+  const y = Number(cell.dataset.y);
+  if (startLocalFire(x, y, battleCtx.send)) {
+    const live = battleCtx.root.querySelector('.bs-battle-live');
+    if (live) patchBattleDom(battleCtx, live);
+  }
+}
+
+function markupScanning() {
+  return `<div class="bs-fx bs-fx-scan" aria-hidden="true">
+    <span class="bs-sonar-ring"></span>
+    <span class="bs-sonar-sweep"></span>
+    <span class="bs-reticle"></span>
+  </div>`;
+}
+
+function markupHit() {
+  return `<div class="bs-fx bs-fx-hit" title="Tocado">
+    <span class="bs-peg"></span>
+    <span class="bs-lbl bs-lbl-hit">Tocado</span>
+  </div>`;
+}
+
+function markupMiss() {
+  return `<div class="bs-fx bs-fx-miss" title="Agua">
+    <svg viewBox="0 0 32 32" class="bs-svg">
+      <ellipse class="bs-splash-outer" cx="16" cy="18" rx="11" ry="5"/>
+      <ellipse class="bs-splash-inner" cx="16" cy="18" rx="6" ry="3"/>
+      <path class="bs-splash-drop" d="M16 8c-2 4-4 6-4 9a4 4 0 008 0c0-3-2-5-4-9z"/>
+    </svg>
+    <span class="bs-lbl bs-lbl-miss">Agua</span>
+  </div>`;
+}
+
+function markupSunk() {
+  return `<div class="bs-fx bs-fx-sunk" title="Hundido">
+    <span class="bs-burst"></span>
+    <span class="bs-lbl bs-lbl-sunk">Hundido</span>
+  </div>`;
+}
+export default function render(ctx) {
+  if (ctx.view.playMode === 'verbal') {
+    renderVerbal(ctx);
+    prevPhase = ctx.view.phase;
+    return;
+  }
+  ensureInit(ctx);
+  if (ctx.view.phase === 'placement') {
+    battleFxReady = false;
+    renderPlacement(ctx);
+  } else {
+    if (prevPhase === 'placement') battleFxReady = false;
+    renderBattle(ctx);
+  }
+  prevPhase = ctx.view.phase;
+}
+
+let placementLive = null;
+let placementGrid = null;
+
+function patchPlacementBoard() {
+  if (!placementGrid) return;
+  clearPreview(placementGrid);
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const cell = placementGrid.querySelector(`[data-x="${x}"][data-y="${y}"]`);
+      if (!cell) continue;
+      cell.className = 'bs-cell';
+      delete cell.dataset.shipSize;
+      const shipIdx = placed.findIndex((cells) => cells?.some((c) => c.x === x && c.y === y));
+      if (shipIdx >= 0) {
+        cell.classList.add('ship');
+        cell.dataset.shipSize = fleet[shipIdx].size;
       }
     }
-    if (!placed) return null;
   }
-  return ships;
+}
+
+function patchPlacementPalette(pal) {
+  if (!pal) return;
+  pal.querySelectorAll('.bs-ship-chip').forEach((chip, i) => {
+    chip.classList.toggle('placed', !!placed[i]);
+    chip.classList.toggle('active', i === selected);
+  });
+}
+
+function patchPlacementControls(wrap) {
+  const ready = wrap.querySelector('.bs-ready-btn');
+  if (ready) ready.disabled = !placed.every(Boolean);
+  const rot = wrap.querySelector('.bs-rotate-btn');
+  if (rot) rot.textContent = '🔄 Girar ' + (orientation === 'h' ? '↔' : '↕');
+}
+
+function onPlacementCellClick(ctx, x, y) {
+  const idx = placed.findIndex((cells) => cells?.some((c) => c.x === x && c.y === y));
+  if (idx >= 0) {
+    placed[idx] = null;
+    selected = idx;
+    patchPlacementUI(ctx);
+    return;
+  }
+  if (selected < 0 || placed[selected]) {
+    const next = placed.findIndex((c) => !c);
+    if (next < 0) return;
+    selected = next;
+  }
+  const cells = cellsFor(x, y, fleet[selected].size, orientation);
+  if (!isValid(cells, selected)) {
+    ctx.toast('No puedes colocar ahí.', 'error');
+    return;
+  }
+  placed[selected] = cells;
+  const next = placed.findIndex((c) => !c);
+  selected = next < 0 ? selected : next;
+  patchPlacementUI(ctx);
+}
+
+function patchPlacementUI(ctx) {
+  if (!placementLive) {
+    renderPlacement(ctx);
+    return;
+  }
+  patchPlacementPalette(placementLive.querySelector('.bs-palette'));
+  patchPlacementBoard();
+  patchPlacementControls(placementLive);
+}
+
+/* ===== Colocación ===== */
+function renderPlacement(ctx) {
+  const { view, root, send, toast } = ctx;
+
+  if (view.myReady) {
+    placementLive = null;
+    placementGrid = null;
+    root.innerHTML = '';
+    const wrap = document.createElement('div');
+    wrap.className = 'bs-game bs-placement';
+    wrap.innerHTML = `<div class="bs-title">🚢 Tocado y Hundido</div>`;
+    wrap.appendChild(section('Tu flota', buildBoard({ mode: 'own', ships: view.myShips, incoming: {} }, null, false)));
+    const wait = document.createElement('p');
+    wait.className = 'bs-status';
+    wait.textContent = view.enemyReady ? '⚔️ Comenzando batalla…' : '⏳ Esperando a que tu rival coloque su flota…';
+    wrap.appendChild(wait);
+    root.appendChild(wrap);
+    return;
+  }
+
+  if (placementLive && root.contains(placementLive)) {
+    patchPlacementUI(ctx);
+    return;
+  }
+
+  root.innerHTML = '';
+  placementLive = document.createElement('div');
+  placementLive.className = 'bs-game bs-placement';
+  placementLive.innerHTML = `<div class="bs-title">🚢 Tocado y Hundido</div>`;
+
+  const pal = buildFleetPalette(
+    fleet, placed, selected,
+    (i) => { selected = i; patchPlacementUI(ctx); },
+    (i) => { placed[i] = null; selected = i; patchPlacementUI(ctx); },
+  );
+  placementLive.appendChild(pal);
+
+  placementGrid = buildBoardSkeleton(false, false);
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const cell = placementGrid.querySelector(`[data-x="${x}"][data-y="${y}"]`);
+      cell.addEventListener('mouseenter', () => preview(placementGrid, x, y));
+      cell.addEventListener('mouseleave', () => clearPreview(placementGrid));
+      cell.addEventListener('click', (e) => {
+        e.preventDefault();
+        onPlacementCellClick(ctx, x, y);
+      });
+    }
+  }
+  placementLive.appendChild(section('Coloca tu flota', placementGrid));
+
+  const controls = document.createElement('div');
+  controls.className = 'bs-controls';
+  const rot = ctrl('🔄 Girar ↔', () => { orientation = orientation === 'h' ? 'v' : 'h'; patchPlacementUI(ctx); });
+  rot.className = 'btn btn-ghost bs-rotate-btn';
+  controls.append(
+    rot,
+    ctrl('🎲 Aleatorio', () => { randomize(); patchPlacementUI(ctx); }),
+    ctrl('🗑️ Borrar todo', () => { placed = fleet.map(() => null); selected = 0; patchPlacementUI(ctx); }),
+  );
+  const ready = document.createElement('button');
+  ready.type = 'button';
+  ready.className = 'btn btn-primary bs-ready-btn';
+  ready.textContent = '⚓ ¡Flota lista!';
+  ready.addEventListener('click', () => {
+    if (!placed.every(Boolean)) return toast('Coloca los 10 barcos.', 'error');
+    send({ type: 'placeShips', ships: placed.map((cells) => ({ cells })) });
+  });
+  controls.appendChild(ready);
+  placementLive.appendChild(controls);
+
+  const hint = document.createElement('p');
+  hint.className = 'bs-hint';
+  hint.textContent = 'Selecciona un barco, haz clic en el tablero para colocarlo. Clic en un barco colocado para quitarlo.';
+  placementLive.appendChild(hint);
+  root.appendChild(placementLive);
+  patchPlacementUI(ctx);
+}
+
+function preview(grid, x, y) {
+  clearPreview(grid);
+  if (selected < 0 || placed[selected]) {
+    const next = placed.findIndex((c) => !c);
+    if (next < 0) return;
+    selected = next;
+  }
+  const cells = cellsFor(x, y, fleet[selected].size, orientation);
+  const valid = isValid(cells, selected);
+  cells.forEach((c) => {
+    if (c.x < 0 || c.y < 0 || c.x >= SIZE || c.y >= SIZE) return;
+    const el = grid.querySelector(`[data-x="${c.x}"][data-y="${c.y}"]`);
+    if (el) el.classList.add(valid ? 'preview' : 'invalid');
+  });
+}
+
+function clearPreview(grid) {
+  grid.querySelectorAll('.preview, .invalid').forEach((el) => el.classList.remove('preview', 'invalid'));
+}
+
+/* ===== Batalla ===== */
+function renderBattle(ctx) {
+  battleCtx = ctx;
+  syncShotsFromView(ctx.view);
+
+  const live = ctx.root.querySelector('.bs-battle-live');
+  if (live) {
+    patchBattleDom(ctx, live);
+    return;
+  }
+  mountBattleDom(ctx);
+}
+
+function mountBattleDom(ctx) {
+  placementLive = null;
+  placementGrid = null;
+  const { view, root, me } = ctx;
+  root.innerHTML = '';
+  const wrap = document.createElement('div');
+  wrap.className = 'bs-game bs-battle-live bs-battle-layout';
+
+  wrap.innerHTML = `<div class="bs-title">🚢 Tocado y Hundido</div>`;
+
+  const ownShips = buildShipSets(view.myShips);
+  const ownGrid = buildBoardSkeleton(false, true);
+  ownGrid.dataset.board = 'own';
+  ownGrid.classList.add('bs-board-own');
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      applyCellVisual(
+        ownGrid.querySelector(`[data-x="${x}"][data-y="${y}"]`),
+        getCellVisual('own', x, y, {
+          incoming: view.myIncoming,
+          sunkSet: new Set(),
+          shipSet: ownShips.shipSet,
+          shipTiny: ownShips.shipTiny,
+        }),
+      );
+    }
+  }
+
+  const ownStrip = document.createElement('div');
+  ownStrip.className = 'bs-battle-own';
+  const ownSection = section('Tu flota', ownGrid);
+  ownSection.classList.add('bs-own-section');
+  ownStrip.appendChild(ownSection);
+  ownStrip.appendChild(buildLegend('Tus barcos', view.myFleetStatus || [], 'own'));
+  wrap.appendChild(ownStrip);
+
+  const fireGrid = buildBoardSkeleton(true, false);
+  fireGrid.dataset.board = 'fire';
+  fireGrid.classList.add('bs-board-fire');
+  fireGrid.addEventListener('click', handleFireBoardClick);
+
+  const fireMain = document.createElement('div');
+  fireMain.className = 'bs-battle-fire';
+  const fireSection = section('Elige dónde disparar', fireGrid);
+  fireSection.classList.add('bs-fire-section');
+  fireMain.appendChild(fireSection);
+  fireMain.appendChild(buildLegend('Barcos enemigos', view.enemyFleetStatus || [], 'enemy'));
+  wrap.appendChild(fireMain);
+
+  const msg = document.createElement('div');
+  msg.className = 'bs-shot-msg';
+  msg.hidden = true;
+  wrap.appendChild(msg);
+
+  const scanHint = document.createElement('p');
+  scanHint.className = 'bs-scan-hint';
+  scanHint.hidden = true;
+  wrap.appendChild(scanHint);
+
+  const resultKey = document.createElement('div');
+  resultKey.className = 'bs-result-key';
+  resultKey.innerHTML = `
+    <span><i class="bs-key-dot hit"></i> Tocado</span>
+    <span><i class="bs-key-dot sunk"></i> Hundido</span>
+    <span><i class="bs-key-dot miss"></i> Agua</span>`;
+  wrap.appendChild(resultKey);
+
+  root.appendChild(wrap);
+  patchBattleDom(ctx, wrap);
+}
+
+let prevBSStatus = '';
+
+function patchBattleDom(ctx, live) {
+  const { view, me } = ctx;
+  const sunkSet = new Set((view.sunkEnemyCells || []).map((c) => key(c.x, c.y)));
+  const ownShips = buildShipSets(view.myShips);
+  const myTurn = view.turn === me && view.status === 'playing';
+  const canFire = myTurn && !hasActiveScan();
+
+  refreshBoardGrid(live.querySelector('[data-board="own"]'), 'own', {
+    incoming: view.myIncoming,
+    sunkSet: new Set(),
+    shipSet: ownShips.shipSet,
+    shipTiny: ownShips.shipTiny,
+  }, false);
+
+  refreshBoardGrid(live.querySelector('[data-board="fire"]'), 'fire', {
+    shots: view.enemyShots,
+    sunkSet,
+  }, canFire);
+
+  refreshLegend(live.querySelector('[data-legend="own"]'), view.myFleetStatus || []);
+  refreshLegend(live.querySelector('[data-legend="enemy"]'), view.enemyFleetStatus || []);
+
+  const msg = live.querySelector('.bs-shot-msg');
+  if (msg) {
+    if (view.lastShot) {
+      const who = view.lastShot.by === me ? 'Tú' : ctx.nameOf(view.lastShot.by);
+      const coord = view.lastShot.coord || label(view.lastShot.x, view.lastShot.y);
+      msg.className = 'bs-shot-msg ' + view.lastShot.result;
+      msg.hidden = false;
+      if (view.lastShot.result === 'hit') {
+        msg.innerHTML = `💥 <strong>${who}</strong> tocó en <strong>${coord}</strong>${view.lastShot.sunk ? ` — ¡Hundido el <em>${view.lastShot.sunk}</em>!` : ''}`;
+      } else {
+        msg.innerHTML = `🌊 <strong>${who}</strong> falló en <strong>${coord}</strong> — Agua`;
+      }
+    } else {
+      msg.hidden = true;
+    }
+  }
+
+  const scanHint = live.querySelector('.bs-scan-hint');
+  if (scanHint) {
+    scanHint.hidden = !hasActiveScan();
+    if (!scanHint.hidden) scanHint.textContent = '📡 Sonar activo…';
+  }
+
+  if (view.status === 'finished' && prevBSStatus !== 'finished') {
+    if (view.winner === me) {
+      SFX.gameWin('battleship');
+      celebrate(live, '🎉', 40);
+    } else if (view.winner) {
+      SFX.gameLose('battleship');
+    }
+  }
+  prevBSStatus = view.status;
+}
+/* ===== Componentes de tablero ===== */
+function section(title, content) {
+  const s = document.createElement('div');
+  s.className = 'bs-section';
+  s.innerHTML = `<div class="bs-section-title">${title}</div>`;
+  s.appendChild(content);
+  return s;
+}
+
+function buildBoardSkeleton(interactive, compact = false) {
+  const outer = document.createElement('div');
+  outer.className = 'bs-board-wrap' + (compact ? ' bs-board-compact' : ' bs-board-main');
+
+  const coordW = compact ? 16 : 28;
+
+  const corner = document.createElement('div');
+  corner.className = 'bs-corner';
+  outer.appendChild(corner);
+
+  for (let x = 0; x < SIZE; x++) {
+    const h = document.createElement('div');
+    h.className = 'bs-coord bs-coord-top';
+    h.textContent = x + 1;
+    outer.appendChild(h);
+  }
+
+  for (let y = 0; y < SIZE; y++) {
+    const rowLabel = document.createElement('div');
+    rowLabel.className = 'bs-coord bs-coord-left';
+    rowLabel.textContent = ROWS[y];
+    outer.appendChild(rowLabel);
+
+    for (let x = 0; x < SIZE; x++) {
+      const cell = document.createElement('div');
+      cell.className = 'bs-cell';
+      cell.dataset.x = x;
+      cell.dataset.y = y;
+      cell.title = label(x, y);
+      outer.appendChild(cell);
+    }
+  }
+
+  outer.style.gridTemplateColumns = `${coordW}px repeat(${SIZE}, 1fr)`;
+  return outer;
+}
+
+function buildBoard(opts, onFire, canFire) {
+  const grid = buildBoardSkeleton(!!onFire);
+  const { shipSet, shipTiny } = buildShipSets(opts.ships);
+  const sunkSet = opts.sunkSet || new Set((opts.sunkCells || []).map((c) => key(c.x, c.y)));
+
+  for (let y = 0; y < SIZE; y++) {
+    for (let x = 0; x < SIZE; x++) {
+      const cell = grid.querySelector(`[data-x="${x}"][data-y="${y}"]`);
+      const k = key(x, y);
+
+      if (opts.mode === 'own') {
+        paintShotCell(cell, 'own', x, y, {
+          incoming: opts.incoming,
+          sunkSet: new Set(),
+          shipSet,
+          shipTiny,
+        });
+      }
+
+      if (opts.mode === 'fire') {
+        paintShotCell(cell, 'fire', x, y, { shots: opts.shots, sunkSet });
+        if (canFire && cell.dataset.visual === 'empty') {
+          cell.classList.add('clickable');
+          cell.addEventListener('click', () => onFire(x, y));
+        }
+      }
+    }
+  }
+  return grid;
+}
+function legendGroups() {
+  return [
+    { size: 4, count: 1 },
+    { size: 3, count: 2 },
+    { size: 2, count: 3 },
+    { size: 1, count: 4 },
+  ];
+}
+
+function createLegendRow(ship, size) {
+  const row = document.createElement('div');
+  row.className = 'bs-legend-row' + (ship?.sunk ? ' sunk' : '');
+  const blocks = document.createElement('div');
+  blocks.className = 'bs-legend-ship';
+  for (let b = 0; b < size; b++) {
+    const block = document.createElement('span');
+    block.className = 'bs-legend-cell';
+    if (ship && b < ship.hits) block.classList.add('hit');
+    blocks.appendChild(block);
+  }
+  row.appendChild(blocks);
+  const chk = document.createElement('span');
+  chk.className = 'bs-legend-check';
+  chk.textContent = ship?.sunk ? '✓' : '';
+  chk.setAttribute('aria-hidden', ship?.sunk ? 'false' : 'true');
+  row.appendChild(chk);
+  return row;
+}
+
+function appendLegendRows(parent, statusList) {
+  legendGroups().forEach((g) => {
+    const shipsOfSize = statusList.filter((s) => s.size === g.size);
+    for (let i = 0; i < g.count; i++) {
+      parent.appendChild(createLegendRow(shipsOfSize[i], g.size));
+    }
+  });
+}
+
+function refreshLegend(leg, statusList) {
+  if (!leg) return;
+  leg.querySelectorAll('.bs-legend-row').forEach((row) => row.remove());
+  appendLegendRows(leg, statusList);
+}
+
+function buildLegend(title, statusList, type) {
+  const leg = document.createElement('div');
+  leg.className = 'bs-legend';
+  leg.dataset.legend = type;
+  leg.innerHTML = `<div class="bs-legend-title">${title}</div>`;
+  appendLegendRows(leg, statusList);
+  return leg;
+}
+
+function buildFleetPalette(fleetList, placedArr, sel, onSelect, onRemove) {
+  const pal = document.createElement('div');
+  pal.className = 'bs-palette';
+  pal.innerHTML = '<div class="bs-palette-title">Barcos a colocar</div>';
+
+  const groups = [
+    { size: 4, count: 1, name: 'Acorazado' },
+    { size: 3, count: 2, name: 'Crucero' },
+    { size: 2, count: 3, name: 'Destructor' },
+    { size: 1, count: 4, name: 'Submarino' },
+  ];
+
+  let idx = 0;
+  groups.forEach((g) => {
+    for (let c = 0; c < g.count; c++) {
+      const i = idx++;
+      const chip = document.createElement('button');
+      chip.className = 'bs-ship-chip';
+      if (placedArr[i]) chip.classList.add('placed');
+      if (i === sel) chip.classList.add('active');
+
+      const visual = document.createElement('span');
+      visual.className = 'bs-chip-visual';
+      for (let b = 0; b < g.size; b++) {
+        const block = document.createElement('span');
+        block.className = 'bs-chip-cell';
+        visual.appendChild(block);
+      }
+      chip.appendChild(visual);
+      chip.appendChild(document.createTextNode(g.name + (g.count > 1 ? ` ${c + 1}` : '')));
+
+      chip.addEventListener('click', () => {
+        if (placedArr[i]) onRemove(i);
+        else onSelect(i);
+      });
+      pal.appendChild(chip);
+    }
+  });
+  return pal;
+}
+
+function ctrl(text, fn) {
+  const b = document.createElement('button');
+  b.className = 'btn btn-ghost';
+  b.style.cssText = 'padding:10px 14px;font-size:.88rem';
+  b.textContent = text;
+  b.addEventListener('click', fn);
+  return b;
 }

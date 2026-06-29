@@ -1,185 +1,90 @@
-// Reversi / Othello — 2 jugadores
+import { SFX } from '../sfx.js';
+import { celebrate, inviteTurn, pop } from '../gameFx.js';
+import { buildScoreChip } from './shared.js';
+
 const SIZE = 8;
-const DIRS = [[-1, 0], [1, 0], [0, -1], [0, 1], [-1, -1], [-1, 1], [1, -1], [1, 1]];
+let liveRoot = null;
+let prevStatus = null;
+let prevLast = null;
 
-function inBounds(r, c) {
-  return r >= 0 && r < SIZE && c >= 0 && c < SIZE;
-}
+export default function render(ctx) {
+  const { view, send, me, root } = ctx;
+  const myTurn = view.turn === me && view.status === 'playing';
+  const myColor = view.colors[me];
+  const oppId = Object.keys(view.colors).find((id) => id !== me);
 
-function opponent(id, state) {
-  return state.order.find((x) => x !== id);
-}
-
-function collectFlips(board, r, c, player, opp) {
-  if (board[r][c] !== null) return null;
-  const flips = [];
-  for (const [dr, dc] of DIRS) {
-    const line = [];
-    let nr = r + dr;
-    let nc = c + dc;
-    while (inBounds(nr, nc) && board[nr][nc] === opp) {
-      line.push([nr, nc]);
-      nr += dr;
-      nc += dc;
-    }
-    if (line.length && inBounds(nr, nc) && board[nr][nc] === player) flips.push(...line);
+  if (!liveRoot || !root.contains(liveRoot)) {
+    root.innerHTML = '';
+    liveRoot = document.createElement('div');
+    liveRoot.className = 'rev-wrap';
+    liveRoot.innerHTML = `
+      <div class="rev-head"></div>
+      <div class="rev-board-wrap"><div class="rev-board"></div></div>
+      <p class="rev-hint"></p>
+      <button type="button" class="btn btn-ghost rev-pass" hidden>Pasar turno</button>`;
+    root.appendChild(liveRoot);
   }
-  return flips.length ? flips : null;
-}
 
-function legalMoves(board, player, opp) {
-  const moves = [];
+  const head = liveRoot.querySelector('.rev-head');
+  head.innerHTML = '';
+  head.appendChild(buildScoreChip(ctx, me, `${view.counts[myColor] || 0} fichas`, myTurn));
+  if (oppId) head.appendChild(buildScoreChip(ctx, oppId, `${view.counts[view.colors[oppId]] || 0} fichas`, view.turn === oppId));
+
+  const boardEl = liveRoot.querySelector('.rev-board');
+  boardEl.innerHTML = '';
+  const validSet = new Set((view.valid || []).map((m) => `${m.r},${m.c}`));
+
   for (let r = 0; r < SIZE; r++) {
     for (let c = 0; c < SIZE; c++) {
-      const flips = collectFlips(board, r, c, player, opp);
-      if (flips) moves.push({ r, c, flips });
+      const cell = document.createElement('button');
+      cell.type = 'button';
+      cell.className = 'rev-cell';
+      const v = view.board[r][c];
+      if (v === 'B') {
+        cell.classList.add('black');
+        cell.textContent = '●';
+      } else if (v === 'W') {
+        cell.classList.add('white');
+        cell.textContent = '●';
+      }
+      const key = `${r},${c}`;
+      if (validSet.has(key) && myTurn) {
+        cell.classList.add('legal');
+        cell.addEventListener('click', () => send({ type: 'place', r, c }));
+      } else {
+        cell.disabled = true;
+      }
+      if (view.lastMove && view.lastMove.r === r && view.lastMove.c === c) cell.classList.add('last');
+      boardEl.appendChild(cell);
     }
   }
-  return moves;
-}
 
-function countDiscs(board) {
-  let a = 0;
-  let b = 0;
-  for (const row of board) {
-    for (const cell of row) {
-      if (cell === 'B') a++;
-      else if (cell === 'W') b++;
+  const hint = liveRoot.querySelector('.rev-hint');
+  const passBtn = liveRoot.querySelector('.rev-pass');
+  if (view.status === 'finished') {
+    hint.textContent = view.winner === me ? '🎉 ¡Has ganado!' : view.winner ? '😬 Has perdido' : '🤝 Empate';
+    passBtn.hidden = true;
+    if (prevStatus !== 'finished') {
+      if (view.winner === me) { SFX.gameWin(ctx.meta.id); celebrate(liveRoot, '🎉', 36); }
+      else if (view.winner) SFX.gameLose(ctx.meta.id);
+      else SFX.draw();
     }
+  } else if (myTurn) {
+    hint.textContent = view.valid.length ? '⚫ Elige casilla (verde = legal)' : 'Sin jugadas — debes pasar';
+    passBtn.hidden = !!view.valid.length;
+    passBtn.onclick = () => send({ type: 'pass' });
+    inviteTurn(hint);
+  } else {
+    hint.textContent = `Turno de ${ctx.nameOf(view.turn)}`;
+    passBtn.hidden = true;
   }
-  return { B: a, W: b };
-}
 
-function cornerScore(r, c) {
-  if ((r === 0 || r === SIZE - 1) && (c === 0 || c === SIZE - 1)) return 100;
-  if (r === 0 || r === SIZE - 1 || c === 0 || c === SIZE - 1) return 8;
-  return 1;
-}
-
-export default {
-  meta: {
-    id: 'reversi',
-    name: 'Reversi',
-    emoji: '⚫',
-    tagline: 'Convierte fichas del rival',
-    description: 'Coloca fichas para encerrar las del oponente y voltearlas. Gana quien tenga más al final.',
-    minPlayers: 2,
-    maxPlayers: 2,
-    gradient: 'linear-gradient(135deg, #1e293b, #059669)',
-  },
-
-  init(players) {
-    const board = Array.from({ length: SIZE }, () => Array(SIZE).fill(null));
-    board[3][3] = 'W';
-    board[3][4] = 'B';
-    board[4][3] = 'B';
-    board[4][4] = 'W';
-    const state = {
-      board,
-      colors: { [players[0].id]: 'B', [players[1].id]: 'W' },
-      order: players.map((p) => p.id),
-      turn: players[0].id,
-      status: 'playing',
-      winner: null,
-      passes: 0,
-      lastMove: null,
-      valid: [],
-    };
-    return refresh(state);
-  },
-
-  action(state, playerId, action) {
-    if (state.status !== 'playing') return { error: 'La partida ha terminado.' };
-    if (action.type === 'pass') {
-      if (state.turn !== playerId) return { error: 'No es tu turno.' };
-      if (state.valid.length) return { error: 'Tienes jugadas disponibles.' };
-      state.passes += 1;
-      state.lastMove = { pass: true, by: playerId };
-      const idx = state.order.indexOf(playerId);
-      state.turn = state.order[(idx + 1) % state.order.length];
-      return { state: refresh(state) };
-    }
-    if (action.type !== 'place') return { error: 'Acción no válida.' };
-    if (state.turn !== playerId) return { error: 'No es tu turno.' };
-
-    const { r, c } = action;
-    if (!inBounds(r, c)) return { error: 'Casilla no válida.' };
-    const opp = opponent(playerId, state);
-    const flips = collectFlips(state.board, r, c, state.colors[playerId], state.colors[opp]);
-    if (!flips) return { error: 'Jugada ilegal.' };
-
-    state.board[r][c] = state.colors[playerId];
-    for (const [fr, fc] of flips) state.board[fr][fc] = state.colors[playerId];
-    state.lastMove = { r, c, flips: flips.length, by: playerId };
-    state.passes = 0;
-    const idx = state.order.indexOf(playerId);
-    state.turn = state.order[(idx + 1) % state.order.length];
-    return { state: refresh(state) };
-  },
-
-  view(state) {
-    return {
-      board: state.board,
-      colors: state.colors,
-      turn: state.turn,
-      status: state.status,
-      winner: state.winner,
-      lastMove: state.lastMove,
-      valid: state.valid,
-      counts: countDiscs(state.board),
-    };
-  },
-
-  bots(state, botIds) {
-    if (state.status !== 'playing' || !botIds.has(state.turn)) return [];
-    const me = state.turn;
-    if (!state.valid.length) return [{ playerId: me, action: { type: 'pass' } }];
-    let best = state.valid[0];
-    let bestScore = -Infinity;
-    for (const m of state.valid) {
-      let score = m.flips.length * 2 + cornerScore(m.r, m.c);
-      if (m.r === 0 || m.r === SIZE - 1) {
-        if (m.c === 1 || m.c === SIZE - 2) score -= 15;
-      }
-      if (m.c === 0 || m.c === SIZE - 1) {
-        if (m.r === 1 || m.r === SIZE - 2) score -= 15;
-      }
-      if (score > bestScore) {
-        bestScore = score;
-        best = m;
-      }
-    }
-    return [{ playerId: me, action: { type: 'place', r: best.r, c: best.c } }];
-  },
-};
-
-function refresh(state) {
-  const opp = opponent(state.turn, state);
-  state.valid = legalMoves(state.board, state.colors[state.turn], state.colors[opp]).map(({ r, c, flips }) => ({ r, c, flips: flips.length }));
-  if (!state.valid.length) {
-    const oppMoves = legalMoves(state.board, state.colors[opp], state.colors[state.turn]);
-    if (!oppMoves.length) {
-      state.status = 'finished';
-      const counts = countDiscs(state.board);
-      const b = state.order[0];
-      const w = state.order[1];
-      const cb = counts[state.colors[b]];
-      const cw = counts[state.colors[w]];
-      if (cb === cw) state.winner = null;
-      else state.winner = cb > cw ? b : w;
-    } else {
-      state.passes += 1;
-      if (state.passes >= 2) {
-        state.status = 'finished';
-        const counts = countDiscs(state.board);
-        const b = state.order[0];
-        const w = state.order[1];
-        const cb = counts[state.colors[b]];
-        const cw = counts[state.colors[w]];
-        if (cb === cw) state.winner = null;
-        else state.winner = cb > cw ? b : w;
-      }
-    }
+  const lk = view.lastMove ? JSON.stringify(view.lastMove) : '';
+  if (lk !== prevLast && view.lastMove && !view.lastMove.pass) {
+    SFX.revPlace();
+    const lastCell = boardEl.querySelector('.rev-cell.last');
+    if (lastCell) pop(lastCell);
   }
-  return state;
+  prevLast = lk;
+  prevStatus = view.status;
 }

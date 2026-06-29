@@ -1,142 +1,139 @@
-// Conecta 4 - 2 jugadores
+import { SFX } from '../sfx.js';
+import { celebrate, inviteTurn, pop, pulse } from '../gameFx.js';
+
 const ROWS = 6;
 const COLS = 7;
+let prevDrop = null;
+let prevStatus = null;
+let hoverCol = null;
 
-function checkWin(board, row, col, player) {
-  const dirs = [
-    [[0, 1], [0, -1]],   // horizontal
-    [[1, 0], [-1, 0]],   // vertical
-    [[1, 1], [-1, -1]],  // diagonal \
-    [[1, -1], [-1, 1]],  // diagonal /
-  ];
-  for (const pair of dirs) {
-    const cells = [[row, col]];
-    for (const [dr, dc] of pair) {
-      let r = row + dr;
-      let c = col + dc;
-      while (r >= 0 && r < ROWS && c >= 0 && c < COLS && board[r][c] === player) {
-        cells.push([r, c]);
-        r += dr;
-        c += dc;
-      }
-    }
-    if (cells.length >= 4) return cells.slice(0, 4).concat(cells.slice(4));
+export default function render(ctx) {
+  const { view, send, me, root } = ctx;
+  const myTurn = view.turn === me && view.status === 'playing';
+  const myColor = view.colors[me];
+  const oppId = Object.keys(view.colors).find((id) => id !== me);
+  const oppColor = oppId ? view.colors[oppId] : null;
+
+  root.innerHTML = '';
+  const outer = document.createElement('div');
+  outer.className = 'c4-outer';
+
+  const head = document.createElement('div');
+  head.className = 'c4-head';
+  head.innerHTML = `
+    <span>Tus fichas: <i class="c4-disc ${myColor} c4-disc-mini"></i> ${myColor === 'red' ? 'Rojas' : 'Amarillas'}</span>
+    ${oppColor ? `<span>Rival: <i class="c4-disc ${oppColor} c4-disc-mini"></i></span>` : ''}`;
+  outer.appendChild(head);
+
+  const wrap = document.createElement('div');
+  wrap.className = 'c4-wrap' + (myTurn ? ' c4-my-turn' : '');
+
+  const cols = document.createElement('div');
+  cols.className = 'c4-cols';
+  for (let c = 0; c < COLS; c++) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'c4-colbtn';
+    btn.textContent = '▼';
+    btn.title = `Soltar ficha columna ${c + 1}`;
+    const full = view.board[0][c] !== null;
+    btn.disabled = !myTurn || full;
+    btn.addEventListener('click', () => send({ type: 'drop', col: c }));
+    btn.addEventListener('mouseenter', () => { hoverCol = c; paintPreview(board, view, myColor, c); });
+    btn.addEventListener('mouseleave', () => { hoverCol = null; paintPreview(board, view, myColor, -1); });
+    cols.appendChild(btn);
   }
-  return null;
-}
 
-export default {
-  meta: {
-    id: 'connect4',
-    name: 'Conecta 4',
-    emoji: '🔴',
-    tagline: 'Alinea cuatro fichas',
-    description: 'Deja caer tus fichas y consigue cuatro en línea antes que tu oponente. ¡Bloquea sus jugadas!',
-    minPlayers: 2,
-    maxPlayers: 2,
-    gradient: 'linear-gradient(135deg, #f59e0b, #ef4444)',
-  },
+  const board = document.createElement('div');
+  board.className = 'c4-board';
+  const winSet = new Set((view.winningCells || []).map(([r, c]) => `${r},${c}`));
+  const isNewDrop = view.lastDrop && (!prevDrop || prevDrop.row !== view.lastDrop.row || prevDrop.col !== view.lastDrop.col);
 
-  init(players) {
-    return {
-      board: Array.from({ length: ROWS }, () => Array(COLS).fill(null)),
-      colors: { [players[0].id]: 'red', [players[1].id]: 'yellow' },
-      turn: players[0].id,
-      status: 'playing',
-      winner: null,
-      winningCells: null,
-      lastDrop: null,
-    };
-  },
+  if (isNewDrop) SFX.c4Drop();
 
-  action(state, playerId, action) {
-    if (state.status !== 'playing') return { error: 'La partida ha terminado.' };
-    if (action.type !== 'drop') return { error: 'Acción no válida.' };
-    if (state.turn !== playerId) return { error: 'No es tu turno.' };
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const cell = document.createElement('div');
+      cell.className = 'c4-cell';
+      cell.dataset.col = c;
+      const owner = view.board[r][c];
+      if (owner) {
+        const disc = document.createElement('div');
+        disc.className = `c4-disc ${view.colors[owner]}`;
+        if (winSet.has(`${r},${c}`)) disc.classList.add('win');
+        if (isNewDrop && view.lastDrop.row === r && view.lastDrop.col === c) disc.dataset.drop = '1';
+        cell.appendChild(disc);
+      }
+      board.appendChild(cell);
+    }
+  }
 
-    const col = action.col;
-    if (typeof col !== 'number' || col < 0 || col >= COLS) return { error: 'Columna no válida.' };
-
-    let placedRow = -1;
+  function paintPreview(boardEl, v, color, col) {
+    boardEl.querySelectorAll('.c4-preview').forEach((el) => el.remove());
+    if (col < 0 || !myTurn) return;
+    let row = -1;
     for (let r = ROWS - 1; r >= 0; r--) {
-      if (state.board[r][col] === null) {
-        state.board[r][col] = playerId;
-        placedRow = r;
-        break;
+      if (!v.board[r][col]) { row = r; break; }
+    }
+    if (row < 0) return;
+    const idx = row * COLS + col;
+    const cell = boardEl.children[idx];
+    const ghost = document.createElement('div');
+    ghost.className = `c4-disc c4-preview ${color}`;
+    cell.appendChild(ghost);
+  }
+
+  if (myTurn && hoverCol !== null) paintPreview(board, view, myColor, hoverCol);
+
+  wrap.appendChild(cols);
+  wrap.appendChild(board);
+  outer.appendChild(wrap);
+
+  const status = document.createElement('p');
+  status.className = 'c4-status';
+  if (view.status === 'finished') {
+    if (view.winner === me) {
+      status.textContent = '🎉 ¡Cuatro en raya!';
+      if (prevStatus !== 'finished') {
+        SFX.c4Win();
+        celebrate(outer, '🎉', 40);
+        pulse(wrap, 'fx-pulse-win');
       }
+    } else if (view.winner) {
+      status.textContent = 'Fin de partida';
+      if (prevStatus !== 'finished') SFX.gameLose(ctx.meta.id);
+    } else {
+      status.textContent = '🤝 Tablero lleno — empate';
+      if (prevStatus !== 'finished') SFX.draw();
     }
-    if (placedRow === -1) return { error: 'Columna llena.' };
+  } else {
+    status.textContent = myTurn ? '👆 Elige columna para soltar tu ficha' : 'Esperando al rival…';
+    if (myTurn) inviteTurn(status);
+  }
+  outer.appendChild(status);
+  root.appendChild(outer);
 
-    state.lastDrop = { row: placedRow, col };
-
-    const win = checkWin(state.board, placedRow, col, playerId);
-    if (win) {
-      state.status = 'finished';
-      state.winner = playerId;
-      state.winningCells = win;
-      return { state };
-    }
-
-    if (state.board.every((row) => row.every((cell) => cell !== null))) {
-      state.status = 'finished';
-      state.winner = null;
-      return { state };
-    }
-
-    const ids = Object.keys(state.colors);
-    state.turn = ids.find((id) => id !== playerId);
-    return { state };
-  },
-
-  view(state) {
-    return state;
-  },
-
-  bots(state, botIds) {
-    if (state.status !== 'playing' || !botIds.has(state.turn)) return [];
-    const me = state.turn;
-    const opp = Object.keys(state.colors).find((id) => id !== me);
-
-    const landingRow = (board, col) => {
-      for (let r = ROWS - 1; r >= 0; r--) if (board[r][col] === null) return r;
-      return -1;
-    };
-    const validCols = [];
-    for (let c = 0; c < COLS; c++) if (state.board[0][c] === null) validCols.push(c);
-
-    const winningCol = (player) => {
-      for (const c of validCols) {
-        const r = landingRow(state.board, c);
-        state.board[r][c] = player;
-        const win = checkWin(state.board, r, c, player);
-        state.board[r][c] = null;
-        if (win) return c;
-      }
-      return -1;
-    };
-
-    let col = winningCol(me);
-    if (col < 0) col = winningCol(opp);
-    if (col < 0) {
-      const order = [3, 2, 4, 1, 5, 0, 6].filter((c) => validCols.includes(c));
-      // Evita dar la victoria al rival en la siguiente jugada
-      const safe = order.filter((c) => {
-        const r = landingRow(state.board, c);
-        state.board[r][c] = me;
-        const above = r - 1;
-        let gives = false;
-        if (above >= 0) {
-          state.board[above][c] = opp;
-          if (checkWin(state.board, above, c, opp)) gives = true;
-          state.board[above][c] = null;
-        }
-        state.board[r][c] = null;
-        return !gives;
+  if (isNewDrop && view.lastDrop) {
+    const { row, col } = view.lastDrop;
+    const idx = row * COLS + col;
+    const disc = board.children[idx]?.querySelector('.c4-disc[data-drop]');
+    if (disc) {
+      requestAnimationFrame(() => {
+        const topCell = board.children[col];
+        const gap = parseFloat(getComputedStyle(board).rowGap || getComputedStyle(board).gap) || 7;
+        const step = topCell.offsetHeight + gap;
+        const dropPx = row * step + topCell.offsetHeight * 0.52;
+        const dur = 0.26 + row * 0.06;
+        disc.style.setProperty('--c4-drop-px', `${dropPx}px`);
+        disc.style.setProperty('--c4-drop-dur', `${dur}s`);
+        disc.classList.add('drop');
+        delete disc.dataset.drop;
+        setTimeout(() => pop(disc), dur * 1000 + 40);
       });
-      const pool = safe.length ? safe : order;
-      col = pool[0];
     }
-    if (col === undefined || col < 0) col = validCols[0];
-    return [{ playerId: me, action: { type: 'drop', col } }];
-  },
-};
+  }
+
+  prevDrop = view.lastDrop;
+  if (view.status === 'finished') prevDrop = null;
+  prevStatus = view.status;
+}

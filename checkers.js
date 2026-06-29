@@ -1,189 +1,234 @@
-// Damas - 2 jugadores (reglas inglesas: captura obligatoria, multi-salto, damas)
+import { SFX } from '../sfx.js';
+import { celebrate, inviteTurn, pop, sparks } from '../gameFx.js';
+
 const N = 8;
+let selected = null;
+let liveGrid = null;
+let liveWrap = null;
+let lastCtx = null;
+let prevLastMove = null;
+let prevBoardState = null;
+let prevStatus = null;
+let pendingMove = false;
 
 function inB(r, c) { return r >= 0 && r < N && c >= 0 && c < N; }
-function clone(board) { return board.map((row) => row.map((cell) => (cell ? { ...cell } : null))); }
-
 function dirsFor(piece, forward) {
-  // forward: +1 o -1 (sentido de avance de los peones)
   if (piece.k) return [[1, 1], [1, -1], [-1, 1], [-1, -1]];
   return [[forward, 1], [forward, -1]];
 }
-
-function capturesForPiece(board, r, c, forward) {
+function capturesFor(board, r, c, forward) {
   const piece = board[r][c];
+  if (!piece) return [];
   const res = [];
   for (const [dr, dc] of dirsFor(piece, forward)) {
     const mr = r + dr, mc = c + dc, tr = r + 2 * dr, tc = c + 2 * dc;
-    if (inB(tr, tc) && board[tr][tc] === null && board[mr] && board[mr][mc] && board[mr][mc].p !== piece.p) {
-      res.push({ to: { r: tr, c: tc }, cap: { r: mr, c: mc } });
+    if (inB(tr, tc) && board[tr][tc] === null && board[mr]?.[mc] && board[mr][mc].p !== piece.p) {
+      res.push({ r: tr, c: tc });
     }
   }
   return res;
 }
-
-function simpleMovesForPiece(board, r, c, forward) {
+function simpleFor(board, r, c, forward) {
   const piece = board[r][c];
+  if (!piece) return [];
   const res = [];
   for (const [dr, dc] of dirsFor(piece, forward)) {
     const tr = r + dr, tc = c + dc;
-    if (inB(tr, tc) && board[tr][tc] === null) res.push({ to: { r: tr, c: tc } });
+    if (inB(tr, tc) && board[tr][tc] === null) res.push({ r: tr, c: tc });
   }
   return res;
 }
-
-function playerPieces(board, pid) {
-  const list = [];
-  for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) if (board[r][c] && board[r][c].p === pid) list.push({ r, c });
-  return list;
-}
-
 function playerHasCapture(board, pid, forward) {
-  return playerPieces(board, pid).some(({ r, c }) => capturesForPiece(board, r, c, forward).length > 0);
+  for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+    if (board[r][c]?.p === pid && capturesFor(board, r, c, forward).length) return true;
+  }
+  return false;
+}
+function legalDests(view, board, me, forward, from) {
+  if (view.mustContinue) return capturesFor(board, from.r, from.c, forward);
+  if (playerHasCapture(board, me, forward)) return capturesFor(board, from.r, from.c, forward);
+  return simpleFor(board, from.r, from.c, forward);
+}
+function boardToDisplay(r, c, flip) {
+  return flip ? { dr: N - 1 - r, dc: N - 1 - c } : { dr: r, dc: c };
+}
+function displayToBoard(dr, dc, flip) {
+  return flip
+    ? { r: N - 1 - dr, c: N - 1 - dc }
+    : { r: dr, c: dc };
 }
 
-function playerHasAnyMove(board, pid, forward) {
-  return playerPieces(board, pid).some(({ r, c }) =>
-    capturesForPiece(board, r, c, forward).length > 0 || simpleMovesForPiece(board, r, c, forward).length > 0);
-}
+function patchHighlights(view, board, me, forward, flip) {
+  if (!liveGrid) return;
 
-export default {
-  meta: {
-    id: 'checkers',
-    name: 'Damas',
-    emoji: '⚪',
-    tagline: 'Captura todas las fichas',
-    description: 'Mueve en diagonal y come las fichas del rival saltando sobre ellas. La captura es obligatoria y encadenas saltos. Llega al fondo para coronar una dama.',
-    minPlayers: 2,
-    maxPlayers: 2,
-    gradient: 'linear-gradient(135deg, #475569, #0f172a)',
-  },
+  let dests = [];
+  if (selected) dests = legalDests(view, board, me, forward, selected);
 
-  init(players) {
-    const a = players[0].id, b = players[1].id;
-    const board = Array.from({ length: N }, () => Array(N).fill(null));
-    for (let r = 0; r < N; r++) {
-      for (let c = 0; c < N; c++) {
-        if ((r + c) % 2 === 1) {
-          if (r < 3) board[r][c] = { p: a, k: false };
-          else if (r > 4) board[r][c] = { p: b, k: false };
-        }
+  const destSet = new Set(dests.map((d) => `${d.r},${d.c}`));
+  const capPieces = new Set();
+  if (view.turn === me && playerHasCapture(board, me, forward)) {
+    for (let r = 0; r < N; r++) for (let c = 0; c < N; c++) {
+      if (board[r][c]?.p === me && capturesFor(board, r, c, forward).length) {
+        capPieces.add(`${r},${c}`);
       }
     }
-    return {
-      board,
-      turn: a,
-      dir: { [a]: 1, [b]: -1 },     // a avanza hacia abajo, b hacia arriba
-      promoteRow: { [a]: N - 1, [b]: 0 },
-      order: [a, b],
-      mustContinue: null,           // {r,c} de la pieza que debe seguir capturando
-      captured: { [a]: 0, [b]: 0 },
-      lastMove: null,
-      status: 'playing',
-      winner: null,
-    };
-  },
+  }
 
-  action(state, playerId, action) {
-    if (state.status !== 'playing') return { error: 'La partida ha terminado.' };
-    if (action.type !== 'move') return { error: 'Acción no válida.' };
-    if (state.turn !== playerId) return { error: 'No es tu turno.' };
-
-    const { from, to } = action;
-    if (!from || !to || !inB(from.r, from.c) || !inB(to.r, to.c)) return { error: 'Movimiento no válido.' };
-    const piece = state.board[from.r][from.c];
-    if (!piece || piece.p !== playerId) return { error: 'Esa no es tu ficha.' };
-    if (state.mustContinue && (state.mustContinue.r !== from.r || state.mustContinue.c !== from.c)) {
-      return { error: 'Debes seguir capturando con la misma ficha.' };
+  for (let dr = 0; dr < N; dr++) {
+    for (let dc = 0; dc < N; dc++) {
+      const { r, c } = displayToBoard(dr, dc, flip);
+      const sq = liveGrid.children[dr * N + dc];
+      sq.classList.remove('sel', 'dest', 'can-capture', 'lastmove', 'capture-flash');
+      const key = `${r},${c}`;
+      if (selected && selected.r === r && selected.c === c) sq.classList.add('sel');
+      if (destSet.has(key)) sq.classList.add('dest');
+      if (capPieces.has(key)) sq.classList.add('can-capture');
+      const lm = view.lastMove;
+      if (lm && ((lm.to.r === r && lm.to.c === c) || (lm.from.r === r && lm.from.c === c))) {
+        sq.classList.add('lastmove');
+        if (lm.capture) sq.classList.add('capture-flash');
+      }
     }
-
-    const forward = state.dir[playerId];
-    const dr = to.r - from.r, dc = to.c - from.c;
-    if (Math.abs(dr) !== Math.abs(dc) || (Math.abs(dr) !== 1 && Math.abs(dr) !== 2)) {
-      return { error: 'Mueve en diagonal.' };
-    }
-
-    const mustCapture = playerHasCapture(state.board, playerId, forward);
-
-    if (Math.abs(dr) === 1) {
-      // Movimiento simple
-      if (mustCapture) return { error: 'Hay captura obligatoria.' };
-      if (state.mustContinue) return { error: 'Debes capturar.' };
-      const moves = simpleMovesForPiece(state.board, from.r, from.c, forward);
-      if (!moves.some((m) => m.to.r === to.r && m.to.c === to.c)) return { error: 'Movimiento no permitido.' };
-      state.board[to.r][to.c] = piece;
-      state.board[from.r][from.c] = null;
-      promote(state, to, piece);
-      state.lastMove = { from, to, capture: false };
-      endTurn(state, playerId);
-      return { state };
-    }
-
-    // Captura
-    const caps = capturesForPiece(state.board, from.r, from.c, forward);
-    const cap = caps.find((m) => m.to.r === to.r && m.to.c === to.c);
-    if (!cap) return { error: 'Captura no válida.' };
-    state.board[to.r][to.c] = piece;
-    state.board[from.r][from.c] = null;
-    state.board[cap.cap.r][cap.cap.c] = null;
-    state.captured[playerId] += 1;
-    state.lastMove = { from, to, capture: true, captured: cap.cap };
-
-    const wasKing = piece.k;
-    promote(state, to, piece);
-    const promotedNow = !wasKing && piece.k;
-
-    // ¿Puede seguir capturando? (salvo que acabe de coronar)
-    const more = !promotedNow && capturesForPiece(state.board, to.r, to.c, forward).length > 0;
-    if (more) {
-      state.mustContinue = { r: to.r, c: to.c };
-      return { state }; // mismo jugador continúa
-    }
-    state.mustContinue = null;
-    endTurn(state, playerId);
-    return { state };
-  },
-
-  view(state) {
-    const counts = {};
-    for (const id of state.order) counts[id] = playerPieces(state.board, id).length;
-    return { ...state, counts };
-  },
-
-  bots(state, botIds) {
-    if (state.status !== 'playing' || !botIds.has(state.turn)) return [];
-    const me = state.turn;
-    const forward = state.dir[me];
-    const board = state.board;
-
-    let froms;
-    if (state.mustContinue) froms = [{ r: state.mustContinue.r, c: state.mustContinue.c }];
-    else froms = playerPieces(board, me);
-
-    const mustCapture = state.mustContinue || playerHasCapture(board, me, forward);
-    const moves = [];
-    for (const { r, c } of froms) {
-      const caps = capturesForPiece(board, r, c, forward);
-      if (caps.length) caps.forEach((m) => moves.push({ from: { r, c }, to: m.to, cap: true }));
-      else if (!mustCapture) simpleMovesForPiece(board, r, c, forward).forEach((m) => moves.push({ from: { r, c }, to: m.to, cap: false }));
-    }
-    const pool = mustCapture ? moves.filter((m) => m.cap) : moves;
-    const chosen = (pool.length ? pool : moves)[Math.floor(Math.random() * (pool.length ? pool.length : moves.length))];
-    if (!chosen) return [];
-    return [{ playerId: me, action: { type: 'move', from: chosen.from, to: chosen.to } }];
-  },
-};
-
-function promote(state, pos, piece) {
-  if (!piece.k && pos.r === state.promoteRow[piece.p]) piece.k = true;
+  }
 }
 
-function endTurn(state, playerId) {
-  const opp = state.order.find((id) => id !== playerId);
-  state.turn = opp;
-  const oppForward = state.dir[opp];
-  if (playerPieces(state.board, opp).length === 0 || !playerHasAnyMove(state.board, opp, oppForward)) {
-    state.status = 'finished';
-    state.winner = playerId;
+function onSquareClick(dr, dc) {
+  const ctx = lastCtx;
+  if (!ctx || pendingMove) return;
+  const { view, send, me } = ctx;
+  if (view.turn !== me || view.status !== 'playing') return;
+
+  const board = view.board;
+  const forward = view.dir[me];
+  const flip = forward === 1;
+  const { r, c } = displayToBoard(dr, dc, flip);
+  const piece = board[r][c];
+  const key = `${r},${c}`;
+
+  if (selected) {
+    const destSet = new Set(
+      legalDests(view, board, me, forward, selected).map((d) => `${d.r},${d.c}`)
+    );
+    if (destSet.has(key)) {
+      pendingMove = true;
+      send({ type: 'move', from: { r: selected.r, c: selected.c }, to: { r, c } });
+      selected = null;
+      return;
+    }
   }
+
+  if (!piece || piece.p !== me) return;
+
+  if (view.mustContinue && (view.mustContinue.r !== r || view.mustContinue.c !== c)) return;
+
+  if (playerHasCapture(board, me, forward) && !capturesFor(board, r, c, forward).length) {
+    ctx.toast('Hay captura obligatoria con otra ficha.', 'error');
+    return;
+  }
+
+  selected = { r, c };
+  patchHighlights(view, board, me, forward, flip);
+}
+
+export default function render(ctx) {
+  lastCtx = ctx;
+  pendingMove = false;
+
+  const { view, me, root } = ctx;
+  const board = view.board;
+  const myTurn = view.turn === me && view.status === 'playing';
+  const forward = view.dir[me];
+  const flip = forward === 1;
+
+  if (prevBoardState && view.lastMove) {
+    const lmKey = `${view.lastMove.from.r},${view.lastMove.from.c}-${view.lastMove.to.r},${view.lastMove.to.c}`;
+    if (lmKey !== prevLastMove) {
+      SFX.chkMove();
+      if (view.lastMove.capture) SFX.chkCapture();
+      const from = view.lastMove.from;
+      const to = view.lastMove.to;
+      const wasPiece = prevBoardState[from.r]?.[from.c];
+      const nowPiece = board[to.r]?.[to.c];
+      if (nowPiece?.k && wasPiece && !wasPiece.k) {
+        SFX.chkKing();
+        const { dr, dc } = boardToDisplay(to.r, to.c, flip);
+        sparks(liveGrid?.children[dr * N + dc], '👑', 4);
+      }
+      const { dr, dc } = boardToDisplay(to.r, to.c, flip);
+      pop(liveGrid?.children[dr * N + dc]);
+      prevLastMove = lmKey;
+    }
+  }
+
+  if (!myTurn) selected = null;
+  if (view.mustContinue && myTurn) {
+    selected = { r: view.mustContinue.r, c: view.mustContinue.c };
+  }
+
+  const opp = view.order.find((id) => id !== me);
+
+  if (!liveWrap || !root.contains(liveWrap)) {
+    root.innerHTML = '';
+    liveWrap = document.createElement('div');
+    liveWrap.className = 'chk-outer';
+    liveWrap.innerHTML = `
+      <div class="chk-capbar"></div>
+      <div class="chk-board"></div>
+      <p class="chk-hint muted"></p>`;
+    liveGrid = liveWrap.querySelector('.chk-board');
+    for (let dr = 0; dr < N; dr++) {
+      for (let dc = 0; dc < N; dc++) {
+        const sq = document.createElement('div');
+        sq.className = 'chk-sq';
+        sq.dataset.dr = dr;
+        sq.dataset.dc = dc;
+        sq.addEventListener('click', () => onSquareClick(Number(sq.dataset.dr), Number(sq.dataset.dc)));
+        liveGrid.appendChild(sq);
+      }
+    }
+    root.appendChild(liveWrap);
+  }
+
+  liveWrap.querySelector('.chk-capbar').innerHTML = `
+    <span>🎯 Tus capturas: <strong>${view.captured[me]}</strong></span>
+    <span>Fichas ${view.counts[me]} vs ${view.counts[opp]}</span>`;
+  liveWrap.classList.toggle('chk-my-turn', myTurn);
+
+  for (let dr = 0; dr < N; dr++) {
+    for (let dc = 0; dc < N; dc++) {
+      const { r, c } = displayToBoard(dr, dc, flip);
+      const sq = liveGrid.children[dr * N + dc];
+      const dark = (r + c) % 2 === 1;
+      sq.className = 'chk-sq ' + (dark ? 'dark' : 'light');
+      sq.replaceChildren();
+      const piece = board[r][c];
+      if (piece) {
+        const disc = document.createElement('div');
+        disc.className = 'chk-disc ' + (piece.p === me ? 'mine' : 'theirs') + (piece.k ? ' king' : '');
+        if (piece.k) disc.textContent = '♛';
+        sq.appendChild(disc);
+      }
+    }
+  }
+
+  patchHighlights(view, board, me, forward, flip);
+
+  const hint = liveWrap.querySelector('.chk-hint');
+  if (view.status === 'finished') {
+    hint.textContent = view.winner === me ? '🎉 ¡Has ganado!' : 'Fin de partida';
+    if (prevStatus !== 'finished') {
+      if (view.winner === me) { SFX.gameWin(ctx.meta.id); celebrate(liveWrap, '🎉', 40); }
+      else SFX.gameLose(ctx.meta.id);
+    }
+  } else if (myTurn) {
+    if (view.mustContinue) hint.textContent = '⚡ ¡Encadena la captura con la misma ficha!';
+    else if (playerHasCapture(board, me, forward)) hint.textContent = '🔴 Captura obligatoria — debes comer';
+    else hint.textContent = 'Selecciona ficha y pulsa la casilla destino (verde)';
+    inviteTurn(hint);
+  } else {
+    hint.textContent = `Turno de ${ctx.nameOf(view.turn)}`;
+  }
+
+  prevBoardState = board.map((row) => row.map((p) => (p ? { ...p } : null)));
+  prevStatus = view.status;
 }
