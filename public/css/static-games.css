@@ -1,0 +1,256 @@
+/* Estilos para juegos estáticos (versión GitHub Pages) */
+
+/* Tres en Raya */
+.ttt-board {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  max-width: 320px;
+  margin: 0 auto;
+  padding: 16px;
+  background: var(--panel);
+  border-radius: var(--radius);
+}
+
+.ttt-cell {
+  aspect-ratio: 1;
+  font-size: 2.5rem;
+  font-weight: 700;
+  background: var(--panel-strong);
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.ttt-cell:hover:not(:disabled) {
+  background: var(--primary);
+  transform: scale(1.05);
+}
+
+.ttt-cell.win {
+  background: var(--good);
+  animation: pulse 0.5s ease-in-out;
+}
+
+/* Conecta 4 */
+.c4-board {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 6px;
+  max-width: 400px;
+  margin: 0 auto;
+  padding: 16px;
+  background: var(--panel);
+  border-radius: var(--radius);
+}
+
+.c4-cell {
+  aspect-ratio: 1;
+  width: 100%;
+  max-width: 50px;
+  background: var(--panel-strong);
+  border-radius: 50%;
+  margin: 0 auto;
+  transition: all 0.2s;
+  cursor: pointer;
+}
+
+.c4-cell:hover:not(.red):not(.yellow) {
+  background: var(--primary);
+}
+
+.c4-cell.red {
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  box-shadow: 0 0 20px rgba(239, 68, 68, 0.5);
+}
+
+.c4-cell.yellow {
+  background: linear-gradient(135deg, #f59e0b, #d97706);
+  box-shadow: 0 0 20px rgba(245, 158, 11, 0.5);
+}
+
+/* Piedra Papel Tijera */
+.rps-info {
+  text-align: center;
+  margin-bottom: 24px;
+  padding: 16px;
+  background: var(--panel);
+  border-radius: var(--radius);
+}
+
+.rps-score {
+  display: flex;
+  justify-content: center;
+  gap: 32px;
+  font-size: 1.2rem;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.rps-round {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.rps-choices {
+  display: flex;
+  justify-content: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 24px 0;
+}
+
+.rps-btn {
+  font-size: 3rem;
+  padding: 20px 30px;
+  background: var(--panel-strong);
+  border-radius: var(--radius);
+  transition: all 0.2s;
+}
+
+.rps-btn:hover {
+  background: var(--primary);
+  transform: scale(1.1);
+}
+
+.rps-result {
+  text-align: center;
+  font-size: 1.2rem;
+  margin-top: 16px;
+  padding: 12px;
+  background: var(--panel);
+  border-radius: 12px;
+}
+
+/* Memoria */
+.memory-info {
+  display: flex;
+  justify-content: center;
+  gap: 32px;
+  margin-bottom: 24px;
+  padding: 12px;
+  background: var(--panel);
+  border-radius: var(--radius);
+}
+
+.memory-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 12px;
+  max-width: 400px;
+  margin: 0 auto;
+}
+
+.memory-card {
+  aspect-ratio: 1;
+  position: relative;
+  background: var(--panel-strong);
+  border-radius: 12px;
+  cursor: pointer;
+  transition: transform 0.3s;
+  transform-style: preserve-3d;
+}
+
+.memory-card:hover:not(.matched) {
+  transform: scale(1.05);
+}
+
+.memory-card.flipped {
+  transform: rotateY(180deg);
+}
+
+.memory-card.matched {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.memory-front,
+.memory-back {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 2rem;
+  backface-visibility: hidden;
+  border-radius: 12px;
+}
+
+.memory-front {
+  background: var(--panel);
+  transform: rotateY(180deg);
+}
+
+.memory-back {
+  background: var(--panel-strong);
+  color: var(--muted);
+}
+
+/* Banner de turno */
+.turn-banner {
+  text-align: center;
+  padding: 12px;
+  margin: 16px 0;
+  background: var(--panel);
+  border-radius: 12px;
+  font-weight: 600;
+  font-size: 1.1rem;
+}
+
+/* Overlay */
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.8);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 20px;
+}
+
+.overlay.hidden {
+  display: none;
+}
+
+.overlay-card {
+  background: var(--bg-2);
+  padding: 40px;
+  border-radius: var(--radius);
+  text-align: center;
+  max-width: 400px;
+  width: 100%;
+  border: 1px solid var(--border);
+}
+
+.overlay-emoji {
+  font-size: 4rem;
+  margin-bottom: 16px;
+}
+
+.overlay-card h2 {
+  font-size: 2rem;
+  margin-bottom: 8px;
+}
+
+.overlay-card p {
+  color: var(--muted);
+  margin-bottom: 24px;
+}
+
+.overlay-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+}
+
+@keyframes pulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.1); }
+}
+
+.text-center {
+  text-align: center;
+}

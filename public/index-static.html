@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#0b1020" />
+  <title>Arcade · Minijuegos (Versión Estática)</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="./css/styles.css" />
+  <link rel="stylesheet" href="./css/game-themes.css" />
+  <link rel="stylesheet" href="./css/game-fit.css" />
+  <link rel="stylesheet" href="./css/new-games.css" />
+  <link rel="stylesheet" href="./css/calm-games.css" />
+  <link rel="stylesheet" href="./css/static-games.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎮</text></svg>" />
+</head>
+<body>
+  <div class="bg-orbs" aria-hidden="true">
+    <span class="orb orb-1"></span>
+    <span class="orb orb-2"></span>
+    <span class="orb orb-3"></span>
+  </div>
+
+  <header class="topbar">
+    <button class="brand" id="brand">
+      <span class="brand-icon">🎮</span>
+      <span class="brand-text">Arcade<span class="brand-dot">.</span></span>
+    </button>
+    <div class="topbar-right">
+      <button class="icon-btn" id="sound-toggle" title="Sonido">🔊</button>
+      <div class="conn" id="conn"><span class="conn-dot"></span><span id="conn-text">Modo Local</span></div>
+    </div>
+  </header>
+
+  <main id="app">
+    <!-- ===== HOME ===== -->
+    <section class="screen active" id="screen-home">
+      <div class="hero">
+        <span class="hero-badge">✨ Versión Estática</span>
+        <h1 class="hero-title">Juega contra la IA<br/><span class="grad-text">sin servidor</span></h1>
+        <p class="hero-sub">Versión optimizada para GitHub Pages. Juega contra bots en tu navegador. Sin conexión, sin login.</p>
+        <div class="hero-actions">
+          <button class="btn btn-primary" id="home-play">🎲 Elegir juego</button>
+        </div>
+        <div class="hero-stats">
+          <div class="stat"><span class="stat-num" id="stat-games">9</span><span class="stat-lbl">Juegos</span></div>
+          <div class="stat"><span class="stat-num">∞</span><span class="stat-lbl">Partidas</span></div>
+          <div class="stat"><span class="stat-num">0€</span><span class="stat-lbl">Gratis</span></div>
+          <div class="stat"><span class="stat-num">1</span><span class="stat-lbl">Jugador</span></div>
+        </div>
+      </div>
+
+      <div class="section-head" id="games"><h2>🎯 Elige tu juego</h2><p>Pulsa una tarjeta para jugar contra la IA.</p></div>
+      <div class="games-grid" id="games-grid"></div>
+
+      <div class="section-head"><h2>⚡ Cómo funciona</h2></div>
+      <div class="steps">
+        <div class="step"><span class="step-num">1</span><h3>Elige un juego</h3><p>Selecciona entre los 9 minijuegos disponibles.</p></div>
+        <div class="step"><span class="step-num">2</span><h3>Juega contra la IA</h3><p>La computadora será tu rival en cada partida.</p></div>
+        <div class="step"><span class="step-num">3</span><h3>¡A ganar!</h3><p>Intenta vencer a la bot en cada juego.</p></div>
+      </div>
+
+      <footer class="site-footer">
+        <span class="brand-icon">🎮</span>
+        <p>Arcade · Versión estática para GitHub Pages</p>
+      </footer>
+    </section>
+
+    <!-- ===== SETUP ===== -->
+    <section class="screen" id="screen-setup">
+      <button class="back-link" data-go="home">← Volver</button>
+      <div class="card setup-card">
+        <h2 class="setup-title" id="setup-title">Configurar partida</h2>
+        <div class="field">
+          <label for="nickname">Tu nombre</label>
+          <input id="nickname" maxlength="16" placeholder="Escribe tu apodo…" autocomplete="off" />
+        </div>
+        <button class="btn btn-primary btn-block" id="btn-start-local">Empezar partida</button>
+      </div>
+    </section>
+
+    <!-- ===== JUEGO ===== -->
+    <section class="screen" id="screen-game">
+      <div class="game-topbar">
+        <button class="back-link" id="leave-game">← Salir</button>
+        <div class="game-title" id="game-title"></div>
+      </div>
+      <div class="turn-banner" id="turn-banner"></div>
+      <div class="game-stage" id="game-stage"></div>
+    </section>
+  </main>
+
+  <!-- Overlay fin de partida -->
+  <div class="overlay" id="overlay">
+    <div class="overlay-card">
+      <div class="overlay-emoji" id="overlay-emoji">🏆</div>
+      <h2 id="overlay-title">¡Fin!</h2>
+      <p id="overlay-sub"></p>
+      <div class="overlay-actions">
+        <button class="btn btn-primary" id="btn-rematch">Jugar de nuevo</button>
+        <button class="btn btn-ghost" id="btn-home">Volver al inicio</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast-wrap" id="toast-wrap"></div>
+
+  <script type="module" src="./js/app-static.js"></script>
+</body>
+</html>
